@@ -1436,6 +1436,10 @@ sk_open(sock *s)
 	if (sk_set_high_port(s) < 0)
 	  log(L_WARN "Socket error: %s%#m", s->err);
 
+    if (s->flags & SKF_FREEBIND)
+      if (sk_set_freebind(s) < 0)
+        log(L_WARN "Socket error: %s%#m", s->err);
+
     sockaddr_fill(&sa, s->af, bind_addr, s->iface, bind_port);
     if (bind(fd, &sa.sa, SA_LEN(sa)) < 0)
       ERR2("bind");
@@ -2042,8 +2046,8 @@ io_update_time(void)
     event_open->duration = last_time - event_open->timestamp;
 
     if (event_open->duration > config->latency_limit)
-      log(L_WARN "Event 0x%p 0x%p took %d ms",
-	  event_open->hook, event_open->data, (int) (event_open->duration TO_MS));
+      log(L_WARN "Event 0x%p 0x%p took %u.%03u ms",
+	  event_open->hook, event_open->data, (uint) (event_open->duration TO_MS), (uint) (event_open->duration % 1000));
 
     event_open = NULL;
   }
@@ -2147,8 +2151,8 @@ watchdog_stop(void)
 
   btime duration = last_time - loop_time;
   if (duration > config->watchdog_warning)
-    log(L_WARN "I/O loop cycle took %d ms for %d events",
-	(int) (duration TO_MS), event_log_num);
+    log(L_WARN "I/O loop cycle took %u.%03u ms for %d events",
+	(uint) (duration TO_MS), (uint) (duration % 1000), event_log_num);
 }
 
 

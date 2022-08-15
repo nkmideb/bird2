@@ -140,6 +140,7 @@ config_parse(struct config *c)
   protos_preconfig(c);
   rt_preconfig(c);
   cf_parse();
+  rt_postconfig(c);
 
   if (EMPTY_LIST(c->protos))
     cf_error("No protocol is specified in the config file");
@@ -520,6 +521,9 @@ order_shutdown(int gr)
   memcpy(c, config, sizeof(struct config));
   init_list(&c->protos);
   init_list(&c->tables);
+  init_list(&c->symbols);
+  memset(c->def_tables, 0, sizeof(c->def_tables));
+  HASH_INIT(c->sym_hash, c->pool, 4);
   c->shutdown = 1;
   c->gr_down = gr;
 
