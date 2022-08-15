@@ -3,6 +3,9 @@ include:
   - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/salsa-ci.yml
   - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/pipeline-jobs.yml
 
+variables:
+  RELEASE: 'bullseye-backports'
+
 blhc:
   # NONVERBOSE BUILD makes blhc fail
   allow_failure: true
