@@ -1,3 +1,9 @@
+bird2 (2.0.10-2~bpo11+1) bullseye-backports; urgency=medium
+
+  * Rebuild for bullseye-backports.
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Mon, 15 Aug 2022 11:01:02 +0000
+
 bird2 (2.0.10-2) unstable; urgency=medium
 
   * d/patches: add patch to increase tests timeout
