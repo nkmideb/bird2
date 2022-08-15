@@ -1,3 +1,9 @@
+bird2 (2.0.10-2nkmi1~dist) unstable; urgency=medium
+
+  * nkmideb release
+
+ -- Sorah Fukumori <her@sorah.jp>  Mon, 15 Aug 2022 15:39:55 +0900
+
 bird2 (2.0.10-2) unstable; urgency=medium
 
   * d/patches: add patch to increase tests timeout
