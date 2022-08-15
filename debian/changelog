@@ -1,3 +1,9 @@
+bird2 (2.0.8-2~bpo11+1) bullseye-backports; urgency=medium
+
+  * Rebuild for bullseye-backports.
+
+ -- Sudip Mukherjee <sudipm.mukherjee@gmail.com>  Tue, 02 Nov 2021 15:46:29 +0000
+
 bird2 (2.0.8-2) unstable; urgency=medium
 
   * Source-only upload to allow migration
