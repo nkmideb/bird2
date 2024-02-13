@@ -61,7 +61,6 @@
 const adata null_adata;		/* adata of length 0 */
 
 const char * const rta_src_names[RTS_MAX] = {
-  [RTS_DUMMY]		= "",
   [RTS_STATIC]		= "static",
   [RTS_INHERIT]		= "inherit",
   [RTS_DEVICE]		= "device",
@@ -76,6 +75,9 @@ const char * const rta_src_names[RTS_MAX] = {
   [RTS_PIPE]		= "pipe",
   [RTS_BABEL]		= "Babel",
   [RTS_RPKI]		= "RPKI",
+  [RTS_PERF]		= "Perf",
+  [RTS_L3VPN]		= "L3VPN",
+  [RTS_AGGREGATED]	= "aggregated",
 };
 
 const char * rta_dest_names[RTD_MAX] = {
@@ -100,7 +102,7 @@ static struct idm src_ids;
 #define RSH_KEY(n)		n->proto, n->private_id
 #define RSH_NEXT(n)		n->next
 #define RSH_EQ(p1,n1,p2,n2)	p1 == p2 && n1 == n2
-#define RSH_FN(p,n)		p->hash_key ^ u32_hash(n)
+#define RSH_FN(p,n)		p->hash_key ^ u64_hash(n)
 
 #define RSH_REHASH		rte_src_rehash
 #define RSH_PARAMS		/2, *2, 1, 1, 8, 20
@@ -155,7 +157,7 @@ rt_prune_sources(void)
     {
       HASH_DO_REMOVE(src_hash, RSH, sp);
       idm_free(&src_ids, src->global_id);
-      sl_free(rte_src_slab, src);
+      sl_free(src);
     }
   }
   HASH_WALK_FILTER_END;
@@ -392,7 +394,7 @@ nexthop_free(struct nexthop *o)
   while (o)
     {
       n = o->next;
-      sl_free(nexthop_slab(o), o);
+      sl_free(o);
       o = n;
     }
 }
@@ -449,8 +451,7 @@ ea_find(ea_list *e, unsigned id)
 {
   eattr *a = ea__find(e, id & EA_CODE_MASK);
 
-  if (a && (a->type & EAF_TYPE_MASK) == EAF_TYPE_UNDEF &&
-      !(id & EA_ALLOW_UNDEF))
+  if (a && a->undef && !(id & EA_ALLOW_UNDEF))
     return NULL;
   return a;
 }
@@ -517,7 +518,7 @@ ea_walk(struct ea_walk_state *s, uint id, uint max)
 
 	BIT32_SET(s->visited, n);
 
-	if ((a->type & EAF_TYPE_MASK) == EAF_TYPE_UNDEF)
+	if (a->undef)
 	  continue;
 
 	s->eattrs = e;
@@ -541,8 +542,8 @@ ea_walk(struct ea_walk_state *s, uint id, uint max)
  * by calling ea_find() to find the attribute, extracting its value or returning
  * a provided default if no such attribute is present.
  */
-int
-ea_get_int(ea_list *e, unsigned id, int def)
+uintptr_t
+ea_get_int(ea_list *e, unsigned id, uintptr_t def)
 {
   eattr *a = ea_find(e, id);
   if (!a)
@@ -617,14 +618,17 @@ ea_do_prune(ea_list *e)
 
       /* Now s0 is the most recent version, s[-1] the oldest one */
       /* Drop undefs */
-      if ((s0->type & EAF_TYPE_MASK) == EAF_TYPE_UNDEF)
+      if (s0->undef)
 	continue;
 
       /* Copy the newest version to destination */
       *d = *s0;
 
       /* Preserve info whether it originated locally */
-      d->type = (d->type & ~(EAF_ORIGINATED|EAF_FRESH)) | (s[-1].type & EAF_ORIGINATED);
+      d->originated = s[-1].originated;
+
+      /* Not fresh any more, we prefer surstroemming */
+      d->fresh = 0;
 
       /* Next destination */
       d++;
@@ -738,6 +742,9 @@ ea_same(ea_list *x, ea_list *y)
       if (a->id != b->id ||
 	  a->flags != b->flags ||
 	  a->type != b->type ||
+	  a->originated != b->originated ||
+	  a->fresh != b->fresh ||
+	  a->undef != b->undef ||
 	  ((a->type & EAF_EMBEDDED) ? a->u.data != b->u.data : !adata_same(a->u.ptr, b->u.ptr)))
 	return 0;
     }
@@ -797,13 +804,27 @@ ea_free(ea_list *o)
 static int
 get_generic_attr(const eattr *a, byte **buf, int buflen UNUSED)
 {
-  if (a->id == EA_GEN_IGP_METRIC)
-    {
-      *buf += bsprintf(*buf, "igp_metric");
-      return GA_NAME;
-    }
+  switch (a->id)
+  {
+  case EA_GEN_IGP_METRIC:
+    *buf += bsprintf(*buf, "igp_metric");
+    return GA_NAME;
 
-  return GA_UNKNOWN;
+  case EA_MPLS_LABEL:
+    *buf += bsprintf(*buf, "mpls_label");
+    return GA_NAME;
+
+  case EA_MPLS_POLICY:
+    *buf += bsprintf(*buf, "mpls_policy");
+    return GA_NAME;
+
+  case EA_MPLS_CLASS:
+    *buf += bsprintf(*buf, "mpls_class");
+    return GA_NAME;
+
+  default:
+    return GA_UNKNOWN;
+  }
 }
 
 void
@@ -940,6 +961,10 @@ ea_show(struct cli *c, const eattr *e)
     {
       *pos++ = ':';
       *pos++ = ' ';
+
+      if (e->undef)
+	bsprintf(pos, "undefined");
+      else
       switch (e->type & EAF_TYPE_MASK)
 	{
 	case EAF_TYPE_INT:
@@ -969,12 +994,13 @@ ea_show(struct cli *c, const eattr *e)
 	case EAF_TYPE_LC_SET:
 	  ea_show_lc_set(c, ad, pos, buf, end);
 	  return;
-	case EAF_TYPE_UNDEF:
 	default:
 	  bsprintf(pos, "<type %02x>", e->type);
 	}
     }
-  cli_printf(c, -1012, "\t%s", buf);
+
+  if (status != GA_HIDDEN)
+    cli_printf(c, -1012, "\t%s", buf);
 }
 
 /**
@@ -1005,7 +1031,7 @@ ea_dump(ea_list *e)
 	  eattr *a = &e->attrs[i];
 	  debug(" %02x:%02x.%02x", EA_PROTO(a->id), EA_ID(a->id), a->flags);
 	  debug("=%c", "?iO?I?P???S?????" [a->type & EAF_TYPE_MASK]);
-	  if (a->type & EAF_ORIGINATED)
+	  if (a->originated)
 	    debug("o");
 	  if (a->type & EAF_EMBEDDED)
 	    debug(":%08x", a->u.data);
@@ -1104,13 +1130,14 @@ rta_hash(rta *a)
   u64 h;
   mem_hash_init(&h);
 #define MIX(f) mem_hash_mix(&h, &(a->f), sizeof(a->f));
-  MIX(src);
+#define BMIX(f) mem_hash_mix_num(&h, a->f);
   MIX(hostentry);
   MIX(from);
   MIX(igp_metric);
-  MIX(source);
-  MIX(scope);
-  MIX(dest);
+  BMIX(source);
+  BMIX(scope);
+  BMIX(dest);
+  MIX(pref);
 #undef MIX
 
   return mem_hash_value(&h) ^ nexthop_hash(&(a->nh)) ^ ea_hash(a->eattrs);
@@ -1119,8 +1146,7 @@ rta_hash(rta *a)
 static inline int
 rta_same(rta *x, rta *y)
 {
-  return (x->src == y->src &&
-	  x->source == y->source &&
+  return (x->source == y->source &&
 	  x->scope == y->scope &&
 	  x->dest == y->dest &&
 	  x->igp_metric == y->igp_metric &&
@@ -1198,7 +1224,7 @@ rta_lookup(rta *o)
   rta *r;
   uint h;
 
-  ASSERT(!(o->aflags & RTAF_CACHED));
+  ASSERT(!o->cached);
   if (o->eattrs)
     ea_normalize(o->eattrs);
 
@@ -1209,8 +1235,7 @@ rta_lookup(rta *o)
 
   r = rta_copy(o);
   r->hash_key = h;
-  r->aflags = RTAF_CACHED;
-  rt_lock_source(r->src);
+  r->cached = 1;
   rt_lock_hostentry(r->hostentry);
   rta_insert(r);
 
@@ -1223,18 +1248,17 @@ rta_lookup(rta *o)
 void
 rta__free(rta *a)
 {
-  ASSERT(rta_cache_count && (a->aflags & RTAF_CACHED));
+  ASSERT(rta_cache_count && a->cached);
   rta_cache_count--;
   *a->pprev = a->next;
   if (a->next)
     a->next->pprev = a->pprev;
   rt_unlock_hostentry(a->hostentry);
-  rt_unlock_source(a->src);
   if (a->nh.next)
     nexthop_free(a->nh.next);
   ea_free(a->eattrs);
-  a->aflags = 0;		/* Poison the entry */
-  sl_free(rta_slab(a), a);
+  a->cached = 0;
+  sl_free(a);
 }
 
 rta *
@@ -1248,7 +1272,7 @@ rta_do_cow(rta *o, linpool *lp)
       memcpy(*nhn, nho, nexthop_size(nho));
       nhn = &((*nhn)->next);
     }
-  r->aflags = 0;
+  r->cached = 0;
   r->uc = 0;
   return r;
 }
@@ -1262,16 +1286,17 @@ rta_do_cow(rta *o, linpool *lp)
 void
 rta_dump(rta *a)
 {
-  static char *rts[] = { "RTS_DUMMY", "RTS_STATIC", "RTS_INHERIT", "RTS_DEVICE",
+  static char *rts[] = { "", "RTS_STATIC", "RTS_INHERIT", "RTS_DEVICE",
 			 "RTS_STAT_DEV", "RTS_REDIR", "RTS_RIP",
 			 "RTS_OSPF", "RTS_OSPF_IA", "RTS_OSPF_EXT1",
-			 "RTS_OSPF_EXT2", "RTS_BGP", "RTS_PIPE", "RTS_BABEL" };
+			 "RTS_OSPF_EXT2", "RTS_BGP", "RTS_PIPE", "RTS_BABEL",
+			 "RTS_RPKI", "RTS_PERF", "RTS_AGGREGATED", };
   static char *rtd[] = { "", " DEV", " HOLE", " UNREACH", " PROHIBIT" };
 
-  debug("p=%s uc=%d %s %s%s h=%04x",
-	a->src->proto->name, a->uc, rts[a->source], ip_scope_text(a->scope),
+  debug("pref=%d uc=%d %s %s%s h=%04x",
+	a->pref, a->uc, rts[a->source], ip_scope_text(a->scope),
 	rtd[a->dest], a->hash_key);
-  if (!(a->aflags & RTAF_CACHED))
+  if (!a->cached)
     debug(" !CACHED");
   debug(" <-%I", a->from);
   if (a->dest == RTD_UNICAST)

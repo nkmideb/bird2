@@ -28,6 +28,7 @@
 
 #define EA_BABEL_METRIC		EA_CODE(PROTOCOL_BABEL, 0)
 #define EA_BABEL_ROUTER_ID	EA_CODE(PROTOCOL_BABEL, 1)
+#define EA_BABEL_SEQNO		EA_CODE(PROTOCOL_BABEL, 2)
 
 #define BABEL_MAGIC		42
 #define BABEL_VERSION		2
@@ -47,12 +48,20 @@
 #define BABEL_ROUTE_REFRESH_FACTOR(X)	((btime)(X)*5/2)	/* 2.5 */
 #define BABEL_SEQNO_REQUEST_RETRY	4
 #define BABEL_SEQNO_REQUEST_EXPIRY	(2 S_)
+#define BABEL_SEQNO_FORWARD_EXPIRY	(10 S_)
+#define BABEL_SEQNO_DUP_SUPPRESS_TIME	(1 S_)
 #define BABEL_GARBAGE_INTERVAL		(300 S_)
 #define BABEL_RXCOST_WIRED		96
 #define BABEL_RXCOST_WIRELESS		256
+#define BABEL_RXCOST_RTT		96
 #define BABEL_INITIAL_HOP_COUNT		255
 #define BABEL_MAX_SEND_INTERVAL		5	/* Unused ? */
 #define BABEL_INITIAL_NEIGHBOR_TIMEOUT	(60 S_)
+
+#define BABEL_RTT_MAX_VALUE		(600 S_)
+#define BABEL_RTT_MIN			(10 MS_)
+#define BABEL_RTT_MAX			(120 MS_)
+#define BABEL_RTT_DECAY			42
 
 /* Max interval that will not overflow when carried as 16-bit centiseconds */
 #define BABEL_TIME_UNITS		10000	/* On-wire times are counted in centiseconds */
@@ -93,6 +102,8 @@ enum babel_tlv_type {
 enum babel_subtlv_type {
   BABEL_SUBTLV_PAD1		= 0,
   BABEL_SUBTLV_PADN		= 1,
+  BABEL_SUBTLV_DIVERSITY	= 2, /* we don't support this */
+  BABEL_SUBTLV_TIMESTAMP	= 3,
 
   /* Mandatory subtlvs */
   BABEL_SUBTLV_SOURCE_PREFIX    = 128,
@@ -103,6 +114,7 @@ enum babel_iface_type {
   BABEL_IFACE_TYPE_UNDEF	= 0,
   BABEL_IFACE_TYPE_WIRED	= 1,
   BABEL_IFACE_TYPE_WIRELESS	= 2,
+  BABEL_IFACE_TYPE_TUNNEL	= 3,
   BABEL_IFACE_TYPE_MAX
 };
 
@@ -111,6 +123,7 @@ enum babel_ae_type {
   BABEL_AE_IP4			= 1,
   BABEL_AE_IP6			= 2,
   BABEL_AE_IP6_LL		= 3,
+  BABEL_AE_IP4_VIA_IP6		= 4,
   BABEL_AE_MAX
 };
 
@@ -137,6 +150,12 @@ struct babel_iface_config {
   uint ihu_interval;			/* IHU interval, in us */
   uint update_interval;			/* Update interval, in us */
 
+  btime rtt_min;			/* rtt above which to start penalising metric */
+  btime rtt_max;			/* max rtt metric penalty applied above this */
+  u16 rtt_cost;			/* metric penalty to apply at rtt_max */
+  u16 rtt_decay;			/* decay of neighbour RTT (units of 1/256) */
+  u8  rtt_send;			/* whether to send timestamps on this interface */
+
   u16 rx_buffer;			/* RX buffer size, 0 for MTU */
   u16 tx_length;			/* TX packet length limit (including headers), 0 for MTU */
   int tx_tos;
@@ -144,8 +163,9 @@ struct babel_iface_config {
 
   ip_addr next_hop_ip4;
   ip_addr next_hop_ip6;
+  u8 ext_next_hop;			/* Enable IPv4 via IPv6 */
 
-  u8 auth_type;			/* Authentication type (BABEL_AUTH_*) */
+  u8 auth_type;				/* Authentication type (BABEL_AUTH_*) */
   u8 auth_permissive;			/* Don't drop packets failing auth check */
   uint mac_num_keys;			/* Number of configured HMAC keys */
   uint mac_total_len;			/* Total digest length for all configured keys */
@@ -224,7 +244,12 @@ struct babel_neighbor {
   u16 next_hello_seqno;
   uint last_hello_int;
 
-  u32 auth_pc;
+  u32 last_tstamp;
+  btime last_tstamp_rcvd;
+  btime srtt;
+
+  u32 auth_pc_unicast;
+  u32 auth_pc_multicast;
   u8 auth_passed;
   u8 auth_index_len;
   u8 auth_index[BABEL_AUTH_INDEX_LEN];
@@ -239,7 +264,6 @@ struct babel_neighbor {
   btime init_expiry;
 
   list routes;				/* Routes this neighbour has sent us (struct babel_route) */
-  list requests;			/* Seqno requests bound to this neighbor */
 };
 
 struct babel_source {
@@ -269,13 +293,13 @@ struct babel_route {
 
 struct babel_seqno_request {
   node n;
-  node nbr_node;
   u64 router_id;
   u16 seqno;
+  u8 forwarded;
   u8 hop_count;
   u8 count;
   btime expires;
-  struct babel_neighbor *nbr;
+  btime dup_suppress_time;
 };
 
 struct babel_entry {
@@ -321,6 +345,8 @@ struct babel_msg_hello {
   u16 seqno;
   uint interval;
   ip_addr sender;
+  u32 tstamp;
+  btime pkt_received;
 };
 
 struct babel_msg_ihu {
@@ -330,6 +356,9 @@ struct babel_msg_ihu {
   uint interval;
   ip_addr addr;
   ip_addr sender;
+  u32 tstamp;
+  u32 tstamp_rcvd;
+  btime pkt_received;
 };
 
 struct babel_msg_update {
@@ -403,6 +432,7 @@ struct babel_msg_auth {
   u8 challenge_seen;
   u8 challenge_len;
   u8 challenge[BABEL_AUTH_MAX_NONCE_LEN];
+  u8 unicast;
 };
 
 static inline int babel_sadr_enabled(struct babel_proto *p)

@@ -171,6 +171,19 @@ times_update_real_time(struct timeloop *loop)
   loop->real_time = ts.tv_sec S + ts.tv_nsec NS;
 }
 
+btime
+current_time_now(void)
+{
+  struct timespec ts;
+  int rv;
+
+  rv = clock_gettime(CLOCK_MONOTONIC, &ts);
+  if (rv < 0)
+    die("clock_gettime: %m");
+
+  return ts.tv_sec S + ts.tv_nsec NS;
+}
+
 
 /**
  * DOC: Sockets
@@ -1854,8 +1867,8 @@ sk_read_ssh(sock *s)
 
  /* sk_read() and sk_write() are called from BFD's event loop */
 
-int
-sk_read(sock *s, int revents)
+static inline int
+sk_read_noflush(sock *s, int revents)
 {
   switch (s->type)
   {
@@ -1918,7 +1931,15 @@ sk_read(sock *s, int revents)
 }
 
 int
-sk_write(sock *s)
+sk_read(sock *s, int revents)
+{
+  int e = sk_read_noflush(s, revents);
+  tmp_flush();
+  return e;
+}
+
+static inline int
+sk_write_noflush(sock *s)
 {
   switch (s->type)
   {
@@ -1966,6 +1987,14 @@ sk_write(sock *s)
   }
 }
 
+int
+sk_write(sock *s)
+{
+  int e = sk_write_noflush(s);
+  tmp_flush();
+  return e;
+}
+
 int sk_is_ipv4(sock *s)
 { return s->af == AF_INET; }
 
@@ -1984,6 +2013,7 @@ sk_err(sock *s, int revents)
     }
 
   s->err_hook(s, se);
+  tmp_flush();
 }
 
 void
@@ -2111,6 +2141,8 @@ watchdog_sigalrm(int sig UNUSED)
   config->latency_limit = 0xffffffff;
   io_update_time();
 
+  debug_safe("Watchdog timer timed out\n");
+
   /* We want core dump */
   abort();
 }
@@ -2194,12 +2226,12 @@ io_loop(void)
   for(;;)
     {
       times_update(&main_timeloop);
-      events = ev_run_list(&global_event_list);
-      events = ev_run_list_limited(&global_work_list, WORK_EVENTS_MAX) || events;
+      ev_run_list(&global_event_list);
+      ev_run_list_limited(&global_work_list, WORK_EVENTS_MAX);
       timers_fire(&main_timeloop);
       io_close_event();
 
-      // FIXME
+      events = !EMPTY_LIST(global_event_list) || !EMPTY_LIST(global_work_list);
       poll_tout = (events ? 0 : 3000); /* Time in milliseconds */
       if (t = timers_first(&main_timeloop))
       {

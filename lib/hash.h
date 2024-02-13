@@ -215,6 +215,20 @@ mem_hash_mix(u64 *h, const void *p, uint s)
     *h = *h * multiplier + pp[i];
 }
 
+static inline void
+mem_hash_mix_str(u64 *h, const char *s)
+{
+  const u64 multiplier = 0xb38bc09a61202731ULL;
+  while (s)
+    *h = *h * multiplier + *s++;
+}
+
+static inline void
+mem_hash_mix_num(u64 *h, u64 val)
+{
+  mem_hash_mix(h, &val, sizeof(val));
+}
+
 static inline uint
 mem_hash_value(u64 *h)
 {
@@ -231,7 +245,7 @@ mem_hash(const void *p, uint s)
 }
 
 static inline uint
-ptr_hash(void *ptr)
+ptr_hash(const void *ptr)
 {
   uintptr_t p = (uintptr_t) ptr;
   return p ^ (p << 8) ^ (p >> 16);

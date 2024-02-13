@@ -51,17 +51,18 @@ cmd_show_symbols(struct sym_show_data *sd)
     cli_msg(1010, "%-8s\t%s", sd->sym->name, cf_symbol_class_name(sd->sym));
   else
   {
-    HASH_WALK(config->sym_hash, next, sym)
-    {
-      if (!sym->scope->active)
-	continue;
+    for (const struct sym_scope *scope = config->root_scope; scope; scope = scope->next)
+      HASH_WALK(scope->hash, next, sym)
+      {
+	if (!sym->scope->active)
+	  continue;
 
-      if (sd->type && (sym->class != sd->type))
-	continue;
+	if (sd->type && (sym->class != sd->type))
+	  continue;
 
-      cli_msg(-1010, "%-8s\t%s", sym->name, cf_symbol_class_name(sym));
-    }
-    HASH_WALK_END;
+	cli_msg(-1010, "%-8s\t%s", sym->name, cf_symbol_class_name(sym));
+      }
+      HASH_WALK_END;
 
     cli_msg(0, "");
   }
@@ -108,6 +109,7 @@ print_size(char *dsc, struct resmem vals)
 
 extern pool *rt_table_pool;
 extern pool *rta_pool;
+extern uint *pages_kept;
 
 void
 cmd_show_memory(void)
@@ -117,10 +119,11 @@ cmd_show_memory(void)
   print_size("Routing tables:", rmemsize(rt_table_pool));
   print_size("Route attributes:", rmemsize(rta_pool));
   print_size("Protocols:", rmemsize(proto_pool));
+  print_size("Current config:", rmemsize(config_pool));
   struct resmem total = rmemsize(&root_pool);
 #ifdef HAVE_MMAP
-  print_size("Standby memory:", (struct resmem) { .overhead = get_page_size() * pages_kept });
-  total.overhead += get_page_size() * pages_kept;
+  print_size("Standby memory:", (struct resmem) { .overhead = page_size * *pages_kept });
+  total.overhead += page_size * *pages_kept;
 #endif
   print_size("Total:", total);
   cli_msg(0, "");

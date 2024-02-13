@@ -1,3 +1,78 @@
+bird2 (2.14-1nkmi1~dist) unstable; urgency=medium
+
+  * nkmideb release
+
+ -- Sorah Fukumori <her@sorah.jp>  Wed, 14 Feb 2024 08:50:05 +0900
+
+bird2 (2.14-1) unstable; urgency=medium
+
+  * New upstream version 2.14 (Closes: #1040031)
+  * Remove patches now included upstream
+  * Remove ancient debian/NEWS
+  * Remove trailing whitespace from d/rules
+  * Add d/bird2-doc.doc-base
+  * Add Rules-Requires-Root: no to d/control
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Tue, 10 Oct 2023 13:14:00 +0200
+
+bird2 (2.0.12-7) unstable; urgency=medium
+
+  [ Miao Wang ]
+  * Fix for arm64 cross build
+
+  [ Jakub Ružička ]
+  * Add autopkgtest by upstream dev
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Wed, 26 Apr 2023 17:33:46 +0200
+
+bird2 (2.0.12-6) unstable; urgency=medium
+
+  * Add upstream patch to fix bgp_med handling
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Mon, 17 Apr 2023 15:18:52 +0200
+
+bird2 (2.0.12-5) unstable; urgency=medium
+
+  * Add upstream patch to fix early free in config
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Mon, 20 Feb 2023 18:14:15 +0100
+
+bird2 (2.0.12-4) unstable; urgency=medium
+
+  * Add patch to increase tests timeout
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Tue, 24 Jan 2023 12:59:59 +0100
+
+bird2 (2.0.12-3) unstable; urgency=medium
+
+  * Rebuild
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Tue, 24 Jan 2023 11:52:35 +0100
+
+bird2 (2.0.12-2) unstable; urgency=medium
+
+  * Don't Depend on obsolete lsb-base
+  * Update Depends: libncurses5-dev -> libncurses-dev
+  * Update version in debian/watch
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Mon, 23 Jan 2023 19:12:43 +0100
+
+bird2 (2.0.12-1) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * debian/copyright: use spaces rather than tabs to start continuation lines.
+  * Bump debhelper from old 12 to 13. + debian/rules:
+    Drop --fail-missing argument to dh_missing, which is now the default.
+  * Update renamed lintian tag names in lintian overrides.
+  * Update standards version to 4.6.1, no changes needed.
+
+  [ Jakub Ružička ]
+  * Extend manpage for birdcl
+  * Remove patch included upstream
+  * Bump Standards-Version to 4.6.2 (no changes)
+
+ -- Jakub Ružička <jakub.ruzicka@nic.cz>  Mon, 23 Jan 2023 17:46:56 +0100
+
 bird2 (2.0.10-2nkmi1~dist) unstable; urgency=medium
 
   * nkmideb release
