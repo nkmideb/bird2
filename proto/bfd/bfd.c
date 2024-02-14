@@ -113,8 +113,8 @@
 #define HASH_IP_EQ(a1,n1,a2,n2)	ipa_equal(a1, a2) && n1 == n2
 #define HASH_IP_FN(a,n)		ipa_hash(a) ^ u32_hash(n)
 
-static list bfd_proto_list;
-static list bfd_wait_list;
+static list STATIC_LIST_INIT(bfd_proto_list);
+static list STATIC_LIST_INIT(bfd_wait_list);
 
 const char *bfd_state_names[] = { "AdminDown", "Down", "Init", "Up" };
 
@@ -508,7 +508,7 @@ bfd_remove_session(struct bfd_proto *p, struct bfd_session *s)
   HASH_REMOVE(p->session_hash_id, HASH_ID, s);
   HASH_REMOVE(p->session_hash_ip, HASH_IP, s);
 
-  sl_free(p->session_slab, s);
+  sl_free(s);
 
   TRACE(D_EVENTS, "Session to %I removed", ip);
 
@@ -638,7 +638,7 @@ bfd_reconfigure_iface(struct bfd_proto *p, struct bfd_iface *ifa, struct bfd_con
  */
 
 static void
-bfd_request_notify(struct bfd_request *req, u8 state, u8 diag)
+bfd_request_notify(struct bfd_request *req, u8 state, u8 remote, u8 diag)
 {
   u8 old_state = req->state;
 
@@ -648,7 +648,7 @@ bfd_request_notify(struct bfd_request *req, u8 state, u8 diag)
   req->state = state;
   req->diag = diag;
   req->old_state = old_state;
-  req->down = (old_state == BFD_STATE_UP) && (state == BFD_STATE_DOWN);
+  req->down = (old_state == BFD_STATE_UP) && (state == BFD_STATE_DOWN) && (remote != BFD_STATE_ADMIN_DOWN);
 
   if (req->hook)
     req->hook(req);
@@ -670,7 +670,7 @@ bfd_add_request(struct bfd_proto *p, struct bfd_request *req)
 
   uint ifindex = req->iface ? req->iface->index : 0;
   struct bfd_session *s = bfd_find_session_by_addr(p, req->addr, ifindex);
-  u8 state, diag;
+  u8 loc_state, rem_state, diag;
 
   if (!s)
     s = bfd_add_session(p, req->addr, req->local, req->iface, &req->opts);
@@ -680,11 +680,12 @@ bfd_add_request(struct bfd_proto *p, struct bfd_request *req)
   req->session = s;
 
   bfd_lock_sessions(p);
-  state = s->loc_state;
+  loc_state = s->loc_state;
+  rem_state = s->rem_state;
   diag = s->loc_diag;
   bfd_unlock_sessions(p);
 
-  bfd_request_notify(req, state, diag);
+  bfd_request_notify(req, loc_state, rem_state, diag);
 
   return 1;
 }
@@ -701,7 +702,7 @@ bfd_submit_request(struct bfd_request *req)
   rem_node(&req->n);
   add_tail(&bfd_wait_list, &req->n);
   req->session = NULL;
-  bfd_request_notify(req, BFD_STATE_ADMIN_DOWN, 0);
+  bfd_request_notify(req, BFD_STATE_ADMIN_DOWN, BFD_STATE_ADMIN_DOWN, 0);
 }
 
 static void
@@ -926,7 +927,7 @@ bfd_notify_hook(sock *sk, uint len UNUSED)
   struct bfd_proto *p = sk->data;
   struct bfd_session *s;
   list tmp_list;
-  u8 state, diag;
+  u8 loc_state, rem_state, diag;
   node *n, *nn;
 
   pipe_drain(sk->fd);
@@ -941,13 +942,14 @@ bfd_notify_hook(sock *sk, uint len UNUSED)
   {
     bfd_lock_sessions(p);
     rem_node(&s->n);
-    state = s->loc_state;
+    loc_state = s->loc_state;
+    rem_state = s->rem_state;
     diag = s->loc_diag;
     bfd_unlock_sessions(p);
 
     s->notify_running = 1;
     WALK_LIST_DELSAFE(n, nn, s->request_list)
-      bfd_request_notify(SKIP_BACK(struct bfd_request, n, n), state, diag);
+      bfd_request_notify(SKIP_BACK(struct bfd_request, n, n), loc_state, rem_state, diag);
     s->notify_running = 0;
 
     /* Remove the session if all requests were removed in notify hooks */
@@ -1006,13 +1008,6 @@ bfd_notify_init(struct bfd_proto *p)
 /*
  *	BFD protocol glue
  */
-
-void
-bfd_init_all(void)
-{
-  init_list(&bfd_proto_list);
-  init_list(&bfd_wait_list);
-}
 
 static struct proto *
 bfd_init(struct proto_config *c)
@@ -1199,3 +1194,9 @@ struct protocol proto_bfd = {
   .reconfigure =	bfd_reconfigure,
   .copy_config =	bfd_copy_config,
 };
+
+void
+bfd_build(void)
+{
+  proto_build(&proto_bfd);
+}

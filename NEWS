@@ -1,3 +1,102 @@
+Version 2.14 (2023-10-06)
+  o MPLS subsystem
+  o L3VPN: BGP/MPLS VPNs (RFC 4364)
+  o BGP: Access to unknown route attributes
+  o RAdv: Custom options
+  o Babel: RTT metric extension
+  o BMP: Refactored route monitoring
+  o BMP: Multiple instances of BMP protocol
+  o BMP: Both pre-policy and post-policy monitoring
+  o Experimental route aggregation
+  o Filter: Method framework
+  o Filter: Functions have return type statements
+  o Filter: New bytestring data type
+  o Kernel: Option to learn kernel routes
+  o Many bugfixes and improvements
+
+  Notes:
+
+  User-defined filter functions that return values now should have return type
+  statements. We still accept functions without such statement, if they could be
+  properly typed.
+
+  For loops allowed to use both existing iterator variables or ones defined in
+  the for statement. We no longer support the first case, all iterator variables
+  must be defined in the for statement (e.g. 'for int i in bgp_path ...').
+
+  Due to oversight, VRF interfaces were not included in respective VRFs, this is
+  fixed now.
+
+
+Version 2.13.1 (2023-06-23)
+  o BGP: Fix role check when no capability option is present
+  o Filter: Fixed segfault when a case option had an empty block
+
+  This is a bugfix version.
+
+Version 2.13 (2023-04-21)
+  o Babel: IPv4 via IPv6 extension (RFC 9229)
+  o Babel: Improve authentication on lossy networks
+  o BGP: New 'allow bgp_med' option
+  o BSD: Support for IPv4 routes with IPv6 nexthop on FreeBSD
+  o Experimental BMP protocol implementation
+  o Important bugfixes
+
+  Notes:
+
+  We changed versioning scheme from <epoch>.<major>.<minor> to more common
+  <major>.<minor>.<patch> . From now on, you may expect that BIRD 2.13.x will be
+  strictly only fixing bugs found in 2.13, whereas BIRD 2.14 will also contain
+  new features.
+
+  This BIRD version contains an alpha release of BMP protocol implementation.
+  It is not ready for production usage and therefore it is not compiled by
+  default and have to be enabled during installation.
+
+
+Version 2.0.12 (2023-01-23)
+  o Filter: New 'onlink' route attribute
+  o Compile-time option to use 4-way tries instead of 16-way ones
+  o BSD: Support for kernel route metric and other improvements
+  o Important bugfixes
+
+Version 2.0.11 (2022-11-12)
+  o BGP roles (RFC 9234)
+  o BGP: Keepalive time scaling
+  o BGP: New 'min hold time' and 'min keepalive time' options
+  o BGP: New 'next hop prefer global' option
+  o Filter: For loops and direct recursion
+  o Filter: Mixed declarations of local variables
+  o Filter: Improved static type checks
+  o Filter: Literal [] for empty set
+  o Linux: Netlink KRT improvements
+  o BSD: Experimental support for Netlink API
+  o Memory management improvements
+  o Many bugfixes
+
+  Notes:
+
+  In contrast to prior versions, configured keepalive time in BGP now scales
+  with negotiated hold time to maintain proportion between the keepalive time
+  and the hold time.
+
+  The Linux KRT was updated to use the recent API for IPv6 ECMP routes instead
+  of the legacy one. Consequently, the Linux versions older than 4.11 are no
+  longer supported, at least for IPv6 ECMP routes. Also, routing table scanning
+  now runs separately for each table to avoid congestion.
+
+  There is a minor change in recursive next hop processing. Previously,
+  recursive next hop must be resolved through a non-recursive route, now it must
+  be resolved through a prefix where both the best route and all routes with the
+  same preference (as the best route) are non-recursive. The old behavior might
+  lead in some corner cases to an infinite loop of recursive next hop resolution
+  due to a priority inversion.
+
+  There is a minor change in the 'configure undo' command, it is no longer
+  available after failed reconfiguration, as the old configuration is already
+  released.
+
+
 Version 2.0.10 (2022-06-16)
   o BGP performance improvements
   o BFD: New 'strict bind' option

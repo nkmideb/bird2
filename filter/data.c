@@ -27,6 +27,7 @@
 
 static const char * const f_type_str[] = {
   [T_VOID]	= "void",
+  [T_NONE]	= "none",
 
   [T_INT]	= "int",
   [T_BOOL]	= "bool",
@@ -46,6 +47,7 @@ static const char * const f_type_str[] = {
   [T_IP]	= "ip",
   [T_NET]	= "prefix",
   [T_STRING]	= "string",
+  [T_BYTESTRING]	= "bytestring",
   [T_PATH_MASK]	= "bgpmask",
   [T_PATH]	= "bgppath",
   [T_CLIST]	= "clist",
@@ -54,6 +56,9 @@ static const char * const f_type_str[] = {
   [T_LC]	= "lc",
   [T_LCLIST]	= "lclist",
   [T_RD]	= "rd",
+
+  [T_ROUTE] = "route",
+  [T_ROUTES_BLOCK] = "block of routes",
 };
 
 const char *
@@ -72,25 +77,19 @@ enum f_type
 f_type_element_type(enum f_type t)
 {
   switch(t) {
+    case T_PATH:   return T_INT;
     case T_CLIST:  return T_PAIR;
     case T_ECLIST: return T_EC;
     case T_LCLIST: return T_LC;
+    case T_ROUTES_BLOCK: return T_ROUTE;
     default: return T_VOID;
   };
 }
 
-const struct f_val f_const_empty_path = {
-  .type = T_PATH,
-  .val.ad = &null_adata,
-}, f_const_empty_clist = {
-  .type = T_CLIST,
-  .val.ad = &null_adata,
-}, f_const_empty_eclist = {
-  .type = T_ECLIST,
-  .val.ad = &null_adata,
-}, f_const_empty_lclist = {
-  .type = T_LCLIST,
-  .val.ad = &null_adata,
+const struct f_trie f_const_empty_trie = { .ipv4 = -1, };
+const struct f_val f_const_empty_prefix_set = {
+  .type = T_PREFIX_SET,
+  .val.ti = &f_const_empty_trie,
 };
 
 static struct adata *
@@ -187,7 +186,7 @@ val_compare(const struct f_val *v1, const struct f_val *v2)
     if (val_is_ip4(v1) && (v2->type == T_QUAD))
       return uint_cmp(ipa_to_u32(v1->val.ip), v2->val.i);
 
-    debug( "Types do not match in val_compare\n" );
+    DBG( "Types do not match in val_compare\n" );
     return F_CMP_ERROR;
   }
 
@@ -211,9 +210,20 @@ val_compare(const struct f_val *v1, const struct f_val *v2)
     return net_compare(v1->val.net, v2->val.net);
   case T_STRING:
     return strcmp(v1->val.s, v2->val.s);
+  case T_PATH:
+    return as_path_compare(v1->val.ad, v2->val.ad);
+  case T_ROUTE:
+  /* Fall through */
+  case T_ROUTES_BLOCK:
   default:
     return F_CMP_ERROR;
   }
+}
+
+static inline int
+bs_same(const struct adata *bs1, const struct adata *bs2)
+{
+  return (bs1->length == bs2->length) && !memcmp(bs1->data, bs2->data, bs1->length);
 }
 
 static inline int
@@ -280,6 +290,8 @@ val_same(const struct f_val *v1, const struct f_val *v2)
     return 0;
 
   switch (v1->type) {
+  case T_BYTESTRING:
+    return bs_same(v1->val.bs, v2->val.bs);
   case T_PATH_MASK:
     return pm_same(v1->val.path_mask, v2->val.path_mask);
   case T_PATH_MASK_ITEM:
@@ -293,6 +305,10 @@ val_same(const struct f_val *v1, const struct f_val *v2)
     return same_tree(v1->val.t, v2->val.t);
   case T_PREFIX_SET:
     return trie_same(v1->val.ti, v2->val.ti);
+  case T_ROUTE:
+    return v1->val.rte == v2->val.rte;
+  case T_ROUTES_BLOCK:
+    return v1->val.ad == v2->val.ad;
   default:
     bug("Invalid type in val_same(): %x", v1->type);
   }
@@ -301,6 +317,12 @@ val_same(const struct f_val *v1, const struct f_val *v2)
 int
 clist_set_type(const struct f_tree *set, struct f_val *v)
 {
+  if (!set)
+  {
+    v->type = T_VOID;
+    return 1;
+  }
+
   switch (set->from.type)
   {
   case T_PAIR:
@@ -324,7 +346,7 @@ clist_set_type(const struct f_tree *set, struct f_val *v)
   }
 }
 
-static int
+int
 clist_match_set(const struct adata *clist, const struct f_tree *set)
 {
   if (!clist)
@@ -345,7 +367,7 @@ clist_match_set(const struct adata *clist, const struct f_tree *set)
   return 0;
 }
 
-static int
+int
 eclist_match_set(const struct adata *list, const struct f_tree *set)
 {
   if (!list)
@@ -369,7 +391,7 @@ eclist_match_set(const struct adata *list, const struct f_tree *set)
   return 0;
 }
 
-static int
+int
 lclist_match_set(const struct adata *list, const struct f_tree *set)
 {
   if (!list)
@@ -537,6 +559,9 @@ val_in_range(const struct f_val *v1, const struct f_val *v2)
   if (v2->type != T_SET)
     return F_CMP_ERROR;
 
+  if (!v2->val.t)
+    return 0;
+
   /* With integrated Quad<->IP implicit conversion */
   if ((v1->type == v2->val.t->from.type) ||
       ((v1->type == T_QUAD) && val_is_ip4(&(v2->val.t->from)) && val_is_ip4(&(v2->val.t->to))))
@@ -558,6 +583,36 @@ val_in_range(const struct f_val *v1, const struct f_val *v2)
 }
 
 /*
+ * rte_format - format route information
+ */
+static void
+rte_format(const struct rte *rte, buffer *buf)
+{
+  if (rte)
+    buffer_print(buf, "Route [%d] to %N from %s.%s via %s",
+                 rte->src->global_id, rte->net->n.addr,
+                 rte->sender->proto->name, rte->sender->name,
+                 rte->src->proto->name);
+  else
+    buffer_puts(buf, "[No route]");
+}
+
+static void
+rte_block_format(const struct rte *rte, buffer *buf)
+{
+  buffer_print(buf, "Block of routes:");
+
+  int i = 0;
+  while (rte)
+  {
+    buffer_print(buf, "%s%d: ", i ? "; " : " ", i);
+    rte_format(rte, buf);
+    rte = rte->next;
+    i++;
+  }
+}
+
+/*
  * val_format - format filter value
  */
 void
@@ -570,6 +625,7 @@ val_format(const struct f_val *v, buffer *buf)
   case T_BOOL:	buffer_puts(buf, v->val.i ? "TRUE" : "FALSE"); return;
   case T_INT:	buffer_print(buf, "%u", v->val.i); return;
   case T_STRING: buffer_print(buf, "%s", v->val.s); return;
+  case T_BYTESTRING: bstrbintohex(v->val.bs->data, v->val.bs->length, buf2, 1000, ':'); buffer_print(buf, "%s", buf2); return;
   case T_IP:	buffer_print(buf, "%I", v->val.ip); return;
   case T_NET:   buffer_print(buf, "%N", v->val.net); return;
   case T_PAIR:	buffer_print(buf, "(%u,%u)", v->val.i >> 16, v->val.i & 0xffff); return;
@@ -585,6 +641,8 @@ val_format(const struct f_val *v, buffer *buf)
   case T_ECLIST: ec_set_format(v->val.ad, -1, buf2, 1000); buffer_print(buf, "(eclist %s)", buf2); return;
   case T_LCLIST: lc_set_format(v->val.ad, -1, buf2, 1000); buffer_print(buf, "(lclist %s)", buf2); return;
   case T_PATH_MASK: pm_format(v->val.path_mask, buf); return;
+  case T_ROUTE: rte_format(v->val.rte, buf); return;
+  case T_ROUTES_BLOCK: rte_block_format(v->val.rte, buf); return;
   default:	buffer_print(buf, "[unknown type %x]", v->type); return;
   }
 }
@@ -609,4 +667,3 @@ val_dump(const struct f_val *v) {
   val_format(v, &b);
   return val_dump_buffer;
 }
-

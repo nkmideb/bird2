@@ -25,9 +25,9 @@
 
 
 static int
-t_reconfig(void)
+t_reconfig(const void *arg)
 {
-  if (!bt_config_file_parse(BT_CONFIG_FILE))
+  if (!bt_config_file_parse(arg))
     return 0;
 
   struct symbol *s;
@@ -46,9 +46,7 @@ run_function(const void *arg)
   if (t->cmp)
     return t->result == f_same(t->fn, t->cmp);
 
-  linpool *tmp = lp_new_default(&root_pool);
-  enum filter_return fret = f_eval(t->fn, tmp, NULL);
-  rfree(tmp);
+  enum filter_return fret = f_eval(t->fn, tmp_linpool, NULL);
 
   return (fret < F_REJECT);
 }
@@ -80,7 +78,9 @@ main(int argc, char *argv[])
   if (!bt_config_file_parse(BT_CONFIG_FILE))
     abort();
 
-  bt_test_suite(t_reconfig, "Testing reconfiguration");
+  bt_test_suite_arg(t_reconfig, BT_CONFIG_FILE ".overlay", "Testing reconfiguration to overlay");
+  bt_test_suite_arg(t_reconfig, BT_CONFIG_FILE, "Testing reconfiguration back");
+  bt_test_suite_arg(t_reconfig, BT_CONFIG_FILE, "Testing reconfiguration to the same file");
 
   struct f_bt_test_suite *t;
   WALK_LIST(t, config->tests)

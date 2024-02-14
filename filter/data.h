@@ -11,6 +11,7 @@
 #define _BIRD_FILTER_DATA_H_
 
 #include "nest/bird.h"
+#include "nest/route.h"
 
 /* Type numbers must be in 0..0xff range */
 #define T_MASK 0xff
@@ -19,6 +20,8 @@
 enum f_type {
 /* Nothing. Simply nothing. */
   T_VOID = 0,
+
+  T_NONE = 1,		/* Special hack to represent missing arguments */
 
 /* User visible types, which fit in int */
   T_INT = 0x10,
@@ -39,6 +42,7 @@ enum f_type {
   T_ENUM_NETTYPE = 0x36,
   T_ENUM_RA_PREFERENCE = 0x37,
   T_ENUM_AF = 0x38,
+  T_ENUM_MPLS_POLICY = 0x39,
 
 /* new enums go here */
   T_ENUM_EMPTY = 0x3f,	/* Special hack for atomic_aggr */
@@ -58,10 +62,21 @@ enum f_type {
   T_LCLIST = 0x29,		/* Large community list */
   T_RD = 0x2a,		/* Route distinguisher for VPN addresses */
   T_PATH_MASK_ITEM = 0x2b,	/* Path mask item for path mask constructors */
+  T_BYTESTRING = 0x2c,
 
+  T_ROUTE = 0x78,
+  T_ROUTES_BLOCK = 0x79,
   T_SET = 0x80,
   T_PREFIX_SET = 0x81,
 } PACKED;
+
+struct f_method {
+  struct symbol *sym;
+  struct f_inst *(*new_inst)(struct f_inst *obj, struct f_inst *args);
+  const struct f_method *next;
+  uint arg_num;
+  enum f_type args_type[];
+};
 
 /* Filter value; size of this affects filter memory consumption */
 struct f_val {
@@ -73,11 +88,13 @@ struct f_val {
     ip_addr ip;
     const net_addr *net;
     const char *s;
+    const struct adata *bs;
     const struct f_tree *t;
     const struct f_trie *ti;
     const struct adata *ad;
     const struct f_path_mask *path_mask;
     struct f_path_mask_item pmi;
+    struct rte *rte;
   } val;
 };
 
@@ -87,6 +104,7 @@ struct f_dynamic_attr {
   u8 bit;		/* For bitfield accessors */
   enum f_type f_type;	/* Filter type */
   uint ea_code;		/* EA code */
+  uint flags;
 };
 
 enum f_sa_code {
@@ -100,7 +118,9 @@ enum f_sa_code {
   SA_IFNAME,
   SA_IFINDEX,
   SA_WEIGHT,
+  SA_PREF,
   SA_GW_MPLS,
+  SA_ONLINK,
 } PACKED;
 
 /* Static attribute definition (members of struct rta) */
@@ -121,6 +141,7 @@ enum f_lval_type {
 /* Filter l-value */
 struct f_lval {
   enum f_lval_type type;
+  struct f_inst *rte;
   union {
     struct symbol *sym;
     struct f_dynamic_attr da;
@@ -140,8 +161,15 @@ struct f_tree {
   void *data;
 };
 
+#ifdef ENABLE_COMPACT_TRIES
+/* Compact 4-way tries */
+#define TRIE_STEP		2
+#define TRIE_STACK_LENGTH	65
+#else
+/* Faster 16-way tries */
 #define TRIE_STEP		4
 #define TRIE_STACK_LENGTH	33
+#endif
 
 struct f_trie_node4
 {
@@ -190,7 +218,9 @@ struct f_trie_walk_state
 struct f_tree *f_new_tree(void);
 struct f_tree *build_tree(struct f_tree *);
 const struct f_tree *find_tree(const struct f_tree *t, const struct f_val *val);
+const struct f_tree *find_tree_linear(const struct f_tree *t, const struct f_val *val);
 int same_tree(const struct f_tree *t0, const struct f_tree *t2);
+int tree_node_count(const struct f_tree *t);
 void tree_format(const struct f_tree *t, buffer *buf);
 void tree_walk(const struct f_tree *t, void (*hook)(const struct f_tree *, void *), void *data);
 
@@ -264,8 +294,8 @@ trie_match_next_longest_ip6(net_addr_ip6 *n, ip6_addr *found)
 #define F_CMP_ERROR 999
 
 const char *f_type_name(enum f_type t);
-
 enum f_type f_type_element_type(enum f_type t);
+struct sym_scope *f_type_method_scope(enum f_type t);
 
 int val_same(const struct f_val *v1, const struct f_val *v2);
 int val_compare(const struct f_val *v1, const struct f_val *v2);
@@ -279,9 +309,15 @@ int val_in_range(const struct f_val *v1, const struct f_val *v2);
 
 int clist_set_type(const struct f_tree *set, struct f_val *v);
 static inline int eclist_set_type(const struct f_tree *set)
-{ return set->from.type == T_EC; }
+{ return !set || set->from.type == T_EC; }
 static inline int lclist_set_type(const struct f_tree *set)
-{ return set->from.type == T_LC; }
+{ return !set || set->from.type == T_LC; }
+static inline int path_set_type(const struct f_tree *set)
+{ return !set || set->from.type == T_INT; }
+
+int clist_match_set(const struct adata *clist, const struct f_tree *set);
+int eclist_match_set(const struct adata *list, const struct f_tree *set);
+int lclist_match_set(const struct adata *list, const struct f_tree *set);
 
 const struct adata *clist_filter(struct linpool *pool, const struct adata *list, const struct f_val *set, int pos);
 const struct adata *eclist_filter(struct linpool *pool, const struct adata *list, const struct f_val *set, int pos);
@@ -289,15 +325,33 @@ const struct adata *lclist_filter(struct linpool *pool, const struct adata *list
 
 
 /* Special undef value for paths and clists */
+
 static inline int
-undef_value(struct f_val v)
+val_is_undefined(struct f_val v)
 {
   return ((v.type == T_PATH) || (v.type == T_CLIST) ||
 	  (v.type == T_ECLIST) || (v.type == T_LCLIST)) &&
     (v.val.ad == &null_adata);
 }
 
-extern const struct f_val f_const_empty_path, f_const_empty_clist, f_const_empty_eclist, f_const_empty_lclist;
+static inline struct f_val
+val_empty(enum f_type t)
+{
+  switch (t)
+  {
+  case T_PATH:
+  case T_CLIST:
+  case T_ECLIST:
+  case T_LCLIST:
+    return (struct f_val) { .type = t, .val.ad = &null_adata };
+
+  default:
+    return (struct f_val) { };
+  }
+}
+
+
+extern const struct f_val f_const_empty_prefix_set;
 
 enum filter_return f_eval(const struct f_line *expr, struct linpool *tmp_pool, struct f_val *pres);
 

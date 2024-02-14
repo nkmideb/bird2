@@ -62,14 +62,17 @@
  *	m4_dnl	INST(FI_NOP, in, out) {			enum value, input args, output args
  *	m4_dnl	  ARG(num, type);			argument, its id (in data fields) and type accessible by v1, v2, v3
  *	m4_dnl	  ARG_ANY(num);				argument with no type check accessible by v1, v2, v3
+ *	m4_dnl	  ARG_TYPE(num, type);			just declare the type of argument
  *	m4_dnl	  VARARG;				variable-length argument list; accessible by vv(i) and whati->varcount
- *	m4_dnl	  LINE(num, unused);			this argument has to be converted to its own f_line
+ *	m4_dnl	  LINE(num, out);			this argument has to be converted to its own f_line
  *	m4_dnl	  SYMBOL;				symbol handed from config
  *	m4_dnl	  STATIC_ATTR;				static attribute definition
  *	m4_dnl	  DYNAMIC_ATTR;				dynamic attribute definition
  *	m4_dnl	  RTC;					route table config
  *	m4_dnl	  ACCESS_RTE;				this instruction needs route
  *	m4_dnl	  ACCESS_EATTRS;			this instruction needs extended attributes
+ *
+ *	m4_dnl	  METHOD_CONSTRUCTOR(name);		this instruction is in fact a method of the first argument's type; register it with the given name for that type
  *
  *	m4_dnl	  FID_MEMBER(				custom instruction member
  *	m4_dnl	    C type,				for storage in structs
@@ -80,9 +83,16 @@
  *	m4_dnl	  )
  *
  *	m4_dnl	  RESULT(type, union-field, value);	putting this on value stack
+ *	m4_dnl	  RESULT_(type, union-field, value);	like RESULT(), but do not declare the type
  *	m4_dnl	  RESULT_VAL(value-struct);		pass the struct f_val directly
+ *	m4_dnl	  RESULT_TYPE(type);			just declare the type of result value
  *	m4_dnl	  RESULT_VOID;				return undef
  *	m4_dnl	}
+ *
+ *	Note that runtime arguments m4_dnl (ARG*, VARARG) must be defined before
+ *	parse-time arguments m4_dnl (LINE, SYMBOL, ...). During linearization,
+ *	first ones move position in f_line by linearizing arguments first, while
+ *	second ones store data to the current position.
  *
  *	Also note that the { ... } blocks are not respected by M4 at all.
  *	If you get weird unmatched-brace-pair errors, check what it generated and why.
@@ -90,6 +100,29 @@
  *	after m4_dnl INST() but all the code between them.
  *
  *	Other code is just copied into the interpreter part.
+ *
+ *	It's also possible to declare type methods in a short way:
+ *
+ *	m4_dnl	METHOD(type, method name, argument count, code)
+ *	m4_dnl	METHOD_R(type, method name, argument count, result type, union-field, value)
+ *
+ *	The filter language uses a simple type system, where values have types
+ *	(constants T_*) and also terms (instructions) are statically typed. Our
+ *	static typing is partial (some terms do not declare types of arguments
+ *	or results), therefore it can detect most but not all type errors and
+ *	therefore we still have runtime type checks.
+ *
+ *	m4_dnl  Types of arguments are declared by macros ARG() and ARG_TYPE(),
+ *	m4_dnl  types of results are declared by RESULT() and RESULT_TYPE().
+ *	m4_dnl  Macros ARG_ANY(), RESULT_() and RESULT_VAL() do not declare types
+ *	m4_dnl  themselves, but can be combined with ARG_TYPE() / RESULT_TYPE().
+ *
+ *	m4_dnl  Note that types should be declared only once. If there are
+ *	m4_dnl  multiple RESULT() macros in an instruction definition, they must
+ *	m4_dnl  use the exact same expression for type, or they should be replaced
+ *	m4_dnl  by multiple RESULT_() macros and a common RESULT_TYPE() macro.
+ *	m4_dnl  See e.g. FI_EA_GET or FI_MIN instructions.
+ *
  *
  *	If you are satisfied with this, you don't need to read the following
  *	detailed description of what is really done with the instruction definitions.
@@ -216,6 +249,37 @@
  *
  *	m4_dnl	If you are stymied, see FI_CALL or FI_CONSTANT or just search for
  *	m4_dnl	the mentioned macros in this file to see what is happening there in wild.
+ *
+ *
+ *	A note about soundness of the type system:
+ *
+ *	A type system is sound when types of expressions are consistent with
+ *	types of values resulting from evaluation of such expressions. Untyped
+ *	expressions are ok, but badly typed expressions are not sound. So is
+ *	the type system of BIRD filtering code sound? There are some points:
+ *
+ *	All cases of (one) m4_dnl RESULT() macro are obviously ok, as the macro
+ *	both declares a type and returns a value. One have to check instructions
+ *	that use m4_dnl RESULT_TYPE() macro. There are two issues:
+ *
+ *	FI_AND, FI_OR - second argument is statically checked to be T_BOOL and
+ *	passed as result without dynamic typecheck, declared to be T_BOOL. If
+ *	an untyped non-bool expression is used as a second argument, then
+ *	the mismatched type is returned.
+ *
+ *	FI_VAR_GET - soundness depends on consistency of declared symbol types
+ *	and stored values. This is maintained when values are stored by
+ *	FI_VAR_SET, but when they are stored by FI_CALL, only static checking is
+ *	used, so when an untyped expression returning mismatched value is used
+ *	as a function argument, then inconsistent value is stored and subsequent
+ *	FI_VAR_GET would be unsound.
+ *
+ *	Both of these issues are inconsequential, as mismatched values from
+ *	unsound expressions will be caught by dynamic typechecks like mismatched
+ *	values from untyped expressions.
+ *
+ *	Also note that FI_CALL is the only expression without properly declared
+ *	result type.
  */
 
 /* Binary operators */
@@ -246,7 +310,7 @@
     RESULT_TYPE(T_BOOL);
 
     if (v1.val.i)
-      LINE(2,0);
+      LINE(2,1);
     else
       RESULT_VAL(v1);
   }
@@ -256,7 +320,7 @@
     RESULT_TYPE(T_BOOL);
 
     if (!v1.val.i)
-      LINE(2,0);
+      LINE(2,1);
     else
       RESULT_VAL(v1);
   }
@@ -349,7 +413,7 @@
 	  break;
 
 	case T_SET:
-	  if (vv(i).val.t->from.type != T_INT)
+	  if (!path_set_type(vv(i).val.t))
 	    runtime("Only integer sets allowed in path mask");
 
 	  pm->item[i] = (struct f_path_mask_item) {
@@ -371,12 +435,14 @@
   INST(FI_NEQ, 2, 1) {
     ARG_ANY(1);
     ARG_ANY(2);
+    ARG_PREFER_SAME_TYPE(1, 2);
     RESULT(T_BOOL, i, !val_same(&v1, &v2));
   }
 
   INST(FI_EQ, 2, 1) {
     ARG_ANY(1);
     ARG_ANY(2);
+    ARG_PREFER_SAME_TYPE(1, 2);
     RESULT(T_BOOL, i, val_same(&v1, &v2));
   }
 
@@ -427,24 +493,34 @@
 
   INST(FI_DEFINED, 1, 1) {
     ARG_ANY(1);
-    RESULT(T_BOOL, i, (v1.type != T_VOID) && !undef_value(v1));
+    RESULT(T_BOOL, i, (v1.type != T_VOID) && !val_is_undefined(v1));
   }
 
-  INST(FI_TYPE, 1, 1) {
-    ARG_ANY(1); /* There may be more types supporting this operation */
-    switch (v1.type)
-    {
-      case T_NET:
-	RESULT(T_ENUM_NETTYPE, i, v1.val.net->type);
-	break;
-      default:
-	runtime( "Can't determine type of this item" );
-    }
+  METHOD_R(T_NET, type, T_ENUM_NETTYPE, i, v1.val.net->type);
+  METHOD_R(T_IP, is_v4, T_BOOL, i, ipa_is_ip4(v1.val.ip));
+
+  /* Add initialized variable */
+  INST(FI_VAR_INIT, 1, 0) {
+    NEVER_CONSTANT;
+    ARG_ANY(1);
+    SYMBOL;
+    ARG_TYPE(1, sym->class & 0xff);
+
+    /* New variable is always the last on stack */
+    uint pos = curline.vbase + sym->offset;
+    fstk->vstk[pos] = v1;
+    fstk->vcnt = pos + 1;
   }
 
-  INST(FI_IS_V4, 1, 1) {
-    ARG(1, T_IP);
-    RESULT(T_BOOL, i, ipa_is_ip4(v1.val.ip));
+  /* Add uninitialized variable */
+  INST(FI_VAR_INIT0, 0, 0) {
+    NEVER_CONSTANT;
+    SYMBOL;
+
+    /* New variable is always the last on stack */
+    uint pos = curline.vbase + sym->offset;
+    fstk->vstk[pos] = val_empty(sym->class & 0xff);
+    fstk->vcnt = pos + 1;
   }
 
   /* Set to indirect value prepared in v1 */
@@ -477,21 +553,100 @@
     RESULT_VAL(val);
   }
 
+  METHOD_R(T_PATH, empty, T_PATH, ad, &null_adata);
+  METHOD_R(T_CLIST, empty, T_CLIST, ad, &null_adata);
+  METHOD_R(T_ECLIST, empty, T_ECLIST, ad, &null_adata);
+  METHOD_R(T_LCLIST, empty, T_LCLIST, ad, &null_adata);
+
+  /* Common loop begin instruction, always created by f_for_cycle() */
+  INST(FI_FOR_LOOP_START, 0, 3) {
+    NEVER_CONSTANT;
+    SYMBOL;
+
+    /* Repeat the instruction which called us */
+    ASSERT_DIE(fstk->ecnt > 1);
+    prevline.pos--;
+
+    /* There should be exactly three items on the value stack to be taken care of */
+    fstk->vcnt += 3;
+
+    /* And these should also stay there after we finish for the caller instruction */
+    curline.ventry += 3;
+
+    /* Assert the iterator variable positioning */
+    ASSERT_DIE(curline.vbase + sym->offset == fstk->vcnt - 1);
+
+    /* The result type declaration makes no sense here but is needed */
+    RESULT_TYPE(T_VOID);
+  }
+
+  /* Type-specific for_next iterators */
+  INST(FI_PATH_FOR_NEXT, 3, 0) {
+    NEVER_CONSTANT;
+    ARG(1, T_PATH);
+    if (as_path_walk(v1.val.ad, &v2.val.i, &v3.val.i))
+      LINE(2,0);
+
+    METHOD_CONSTRUCTOR("!for_next");
+  }
+
+  INST(FI_CLIST_FOR_NEXT, 3, 0) {
+    NEVER_CONSTANT;
+    ARG(1, T_CLIST);
+    if (int_set_walk(v1.val.ad, &v2.val.i, &v3.val.i))
+      LINE(2,0);
+
+    METHOD_CONSTRUCTOR("!for_next");
+  }
+
+  INST(FI_ECLIST_FOR_NEXT, 3, 0) {
+    NEVER_CONSTANT;
+    ARG(1, T_ECLIST);
+    if (ec_set_walk(v1.val.ad, &v2.val.i, &v3.val.ec))
+      LINE(2,0);
+
+    METHOD_CONSTRUCTOR("!for_next");
+  }
+
+  INST(FI_LCLIST_FOR_NEXT, 3, 0) {
+    NEVER_CONSTANT;
+    ARG(1, T_LCLIST);
+    if (lc_set_walk(v1.val.ad, &v2.val.i, &v3.val.lc))
+      LINE(2,0);
+
+    METHOD_CONSTRUCTOR("!for_next");
+  }
+
+  INST(FI_ROUTES_BLOCK_FOR_NEXT, 3, 0) {
+    NEVER_CONSTANT;
+    ARG(1, T_ROUTES_BLOCK);
+    if (!v2.type)
+      v2 = v1;
+
+    if (v2.val.rte)
+    {
+      v3.val.rte = v2.val.rte;
+      v2.val.rte = v2.val.rte->next;
+      LINE(2,0);
+    }
+
+    METHOD_CONSTRUCTOR("!for_next");
+  }
+
   INST(FI_CONDITION, 1, 0) {
     ARG(1, T_BOOL);
     if (v1.val.i)
       LINE(2,0);
     else
-      LINE(3,1);
+      LINE(3,0);
   }
 
-  INST(FI_PRINT, 0, 0) {
+  INST(FI_PRINT, 1, 0) {
     NEVER_CONSTANT;
-    VARARG;
+    ARG_ANY(1);
 
-    if (whati->varcount && !(fs->flags & FF_SILENT))
-      for (uint i=0; i<whati->varcount; i++)
-	val_format(&(vv(i)), &fs->buf);
+    if (!(fs->flags & FF_SILENT))
+      val_format(&v1, &fs->buf);
   }
 
   INST(FI_FLUSH, 0, 0) {
@@ -515,25 +670,29 @@
     }
   }
 
-  INST(FI_RTA_GET, 0, 1) {
+  INST(FI_RTA_GET, 1, 1) {
     {
-      STATIC_ATTR;
       ACCESS_RTE;
-      struct rta *rta = (*fs->rte)->attrs;
+      ARG(1, T_ROUTE);
+      STATIC_ATTR;
+
+      struct rta *rta = v1.val.rte ? v1.val.rte->attrs : (*fs->rte)->attrs;
 
       switch (sa.sa_code)
       {
       case SA_FROM:	RESULT(sa.f_type, ip, rta->from); break;
       case SA_GW:	RESULT(sa.f_type, ip, rta->nh.gw); break;
       case SA_NET:	RESULT(sa.f_type, net, (*fs->rte)->net->n.addr); break;
-      case SA_PROTO:	RESULT(sa.f_type, s, rta->src->proto->name); break;
+      case SA_PROTO:	RESULT(sa.f_type, s, (*fs->rte)->src->proto->name); break;
       case SA_SOURCE:	RESULT(sa.f_type, i, rta->source); break;
       case SA_SCOPE:	RESULT(sa.f_type, i, rta->scope); break;
       case SA_DEST:	RESULT(sa.f_type, i, rta->dest); break;
       case SA_IFNAME:	RESULT(sa.f_type, s, rta->nh.iface ? rta->nh.iface->name : ""); break;
       case SA_IFINDEX:	RESULT(sa.f_type, i, rta->nh.iface ? rta->nh.iface->index : 0); break;
       case SA_WEIGHT:	RESULT(sa.f_type, i, rta->nh.weight + 1); break;
+      case SA_PREF:	RESULT(sa.f_type, i, rta->pref); break;
       case SA_GW_MPLS:	RESULT(sa.f_type, i, rta->nh.labels ? rta->nh.label[0] : MPLS_NULL); break;
+      case SA_ONLINK:	RESULT(sa.f_type, i, rta->nh.flags & RNF_ONLINK ? 1 : 0); break;
 
       default:
 	bug("Invalid static attribute access (%u/%u)", sa.f_type, sa.sa_code);
@@ -560,8 +719,8 @@
       case SA_GW:
 	{
 	  ip_addr ip = v1.val.ip;
-	  struct iface *ifa = ipa_is_link_local(ip) ? rta->nh.iface : NULL;
-	  neighbor *n = neigh_find(rta->src->proto, ip, ifa, 0);
+	  struct iface *ifa = ipa_is_link_local(ip) || (rta->nh.flags & RNF_ONLINK) ? rta->nh.iface : NULL;
+	  neighbor *n = neigh_find((*fs->rte)->src->proto, ip, ifa, (rta->nh.flags & RNF_ONLINK) ? NEF_ONLINK : 0);
 	  if (!n || (n->scope == SCOPE_HOST))
 	    runtime( "Invalid gw address" );
 
@@ -637,47 +796,37 @@
         }
 	break;
 
+      case SA_PREF:
+	rta->pref = v1.val.i;
+	break;
+
+      case SA_ONLINK:
+	{
+	  if (v1.val.i)
+	    rta->nh.flags |= RNF_ONLINK;
+	  else
+	    rta->nh.flags &= ~RNF_ONLINK;
+	}
+	break;
+
       default:
 	bug("Invalid static attribute access (%u/%u)", sa.f_type, sa.sa_code);
       }
     }
   }
 
-  INST(FI_EA_GET, 0, 1) {	/* Access to extended attributes */
-    DYNAMIC_ATTR;
+  INST(FI_EA_GET, 1, 1) {	/* Access to extended attributes */
     ACCESS_RTE;
     ACCESS_EATTRS;
+    ARG(1, T_ROUTE);
+    DYNAMIC_ATTR;
     RESULT_TYPE(da.f_type);
     {
-      eattr *e = ea_find(*fs->eattrs, da.ea_code);
+      struct ea_list *eal = v1.val.rte ? v1.val.rte->attrs->eattrs : *fs->eattrs;
+      eattr *e = ea_find(eal, da.ea_code);
 
       if (!e) {
-	/* A special case: undefined as_path looks like empty as_path */
-	if (da.type == EAF_TYPE_AS_PATH) {
-	  RESULT_(T_PATH, ad, &null_adata);
-	  break;
-	}
-
-	/* The same special case for int_set */
-	if (da.type == EAF_TYPE_INT_SET) {
-	  RESULT_(T_CLIST, ad, &null_adata);
-	  break;
-	}
-
-	/* The same special case for ec_set */
-	if (da.type == EAF_TYPE_EC_SET) {
-	  RESULT_(T_ECLIST, ad, &null_adata);
-	  break;
-	}
-
-	/* The same special case for lc_set */
-	if (da.type == EAF_TYPE_LC_SET) {
-	  RESULT_(T_LCLIST, ad, &null_adata);
-	  break;
-	}
-
-	/* Undefined value */
-	RESULT_VOID;
+	RESULT_VAL(val_empty(da.f_type));
 	break;
       }
 
@@ -689,7 +838,10 @@
 	RESULT_(T_QUAD, i, e->u.data);
 	break;
       case EAF_TYPE_OPAQUE:
-	RESULT_(T_ENUM_EMPTY, i, 0);
+	if (da.f_type == T_ENUM_EMPTY)
+	  RESULT_(T_ENUM_EMPTY, i, 0);
+	else
+	  RESULT_(T_BYTESTRING, ad, e->u.ptr);
 	break;
       case EAF_TYPE_IP_ADDRESS:
 	RESULT_(T_IP, ip, *((ip_addr *) e->u.ptr->data));
@@ -709,9 +861,6 @@
       case EAF_TYPE_LC_SET:
 	RESULT_(T_LCLIST, ad, e->u.ptr);
 	break;
-      case EAF_TYPE_UNDEF:
-	RESULT_VOID;
-	break;
       default:
 	bug("Unknown dynamic attribute type");
       }
@@ -724,6 +873,12 @@
     ARG_ANY(1);
     DYNAMIC_ATTR;
     ARG_TYPE(1, da.f_type);
+
+    FID_NEW_BODY;
+      if (da.f_type == T_ENUM_EMPTY)
+	cf_error("Setting opaque attribute is not allowed");
+
+    FID_INTERPRET_BODY;
     {
       struct ea_list *l = lp_alloc(fs->pool, sizeof(struct ea_list) + sizeof(eattr));
 
@@ -731,17 +886,16 @@
       l->flags = EALF_SORTED;
       l->count = 1;
       l->attrs[0].id = da.ea_code;
-      l->attrs[0].flags = 0;
-      l->attrs[0].type = da.type | EAF_ORIGINATED | EAF_FRESH;
+      l->attrs[0].flags = da.flags;
+      l->attrs[0].type = da.type;
+      l->attrs[0].originated = 1;
+      l->attrs[0].fresh = 1;
+      l->attrs[0].undef = 0;
 
       switch (da.type) {
       case EAF_TYPE_INT:
       case EAF_TYPE_ROUTER_ID:
 	l->attrs[0].u.data = v1.val.i;
-	break;
-
-      case EAF_TYPE_OPAQUE:
-	runtime( "Setting opaque attribute is not allowed" );
 	break;
 
       case EAF_TYPE_IP_ADDRESS:;
@@ -752,6 +906,7 @@
 	l->attrs[0].u.ptr = ad;
 	break;
 
+      case EAF_TYPE_OPAQUE:
       case EAF_TYPE_AS_PATH:
       case EAF_TYPE_INT_SET:
       case EAF_TYPE_EC_SET:
@@ -787,51 +942,20 @@
     ACCESS_RTE;
     ACCESS_EATTRS;
 
-    {
-      struct ea_list *l = lp_alloc(fs->pool, sizeof(struct ea_list) + sizeof(eattr));
-
-      l->next = NULL;
-      l->flags = EALF_SORTED;
-      l->count = 1;
-      l->attrs[0].id = da.ea_code;
-      l->attrs[0].flags = 0;
-      l->attrs[0].type = EAF_TYPE_UNDEF | EAF_ORIGINATED | EAF_FRESH;
-      l->attrs[0].u.data = 0;
-
-      f_rta_cow(fs);
-      l->next = *fs->eattrs;
-      *fs->eattrs = l;
-    }
+    f_rta_cow(fs);
+    ea_unset_attr(fs->eattrs, fs->pool, 1, da.ea_code);
   }
 
-  INST(FI_PREF_GET, 0, 1) {
-    ACCESS_RTE;
-    RESULT(T_INT, i, (*fs->rte)->pref);
-  }
-
-  INST(FI_PREF_SET, 1, 0) {
-    ACCESS_RTE;
-    ARG(1,T_INT);
-    if (v1.val.i > 0xFFFF)
-      runtime( "Setting preference value out of bounds" );
-    f_rte_cow(fs);
-    (*fs->rte)->pref = v1.val.i;
-  }
-
-  INST(FI_LENGTH, 1, 1) {	/* Get length of */
-    ARG_ANY(1);
-    switch(v1.type) {
-    case T_NET:    RESULT(T_INT, i, net_pxlen(v1.val.net)); break;
-    case T_PATH:   RESULT(T_INT, i, as_path_getlen(v1.val.ad)); break;
-    case T_CLIST:  RESULT(T_INT, i, int_set_get_size(v1.val.ad)); break;
-    case T_ECLIST: RESULT(T_INT, i, ec_set_get_size(v1.val.ad)); break;
-    case T_LCLIST: RESULT(T_INT, i, lc_set_get_size(v1.val.ad)); break;
-    default: runtime( "Prefix, path, clist or eclist expected" );
-    }
-  }
+  /* Get length of */
+  METHOD_R(T_NET, len, T_INT, i, net_pxlen(v1.val.net));
+  METHOD_R(T_PATH, len, T_INT, i, as_path_getlen(v1.val.ad));
+  METHOD_R(T_CLIST, len, T_INT, i, int_set_get_size(v1.val.ad));
+  METHOD_R(T_ECLIST, len, T_INT, i, ec_set_get_size(v1.val.ad));
+  METHOD_R(T_LCLIST, len, T_INT, i, lc_set_get_size(v1.val.ad));
 
   INST(FI_NET_SRC, 1, 1) { 	/* Get src prefix */
     ARG(1, T_NET);
+    METHOD_CONSTRUCTOR("src");
 
     net_addr_union *net = (void *) v1.val.net;
     net_addr *src = falloc(sizeof(net_addr_ip6));
@@ -867,6 +991,7 @@
 
   INST(FI_NET_DST, 1, 1) { 	/* Get dst prefix */
     ARG(1, T_NET);
+    METHOD_CONSTRUCTOR("dst");
 
     net_addr_union *net = (void *) v1.val.net;
     net_addr *dst = falloc(sizeof(net_addr_ip6));
@@ -900,158 +1025,80 @@
     RESULT(T_NET, net, dst);
   }
 
-  INST(FI_ROA_MAXLEN, 1, 1) { 	/* Get ROA max prefix length */
-    ARG(1, T_NET);
+  /* Get ROA max prefix length */
+  METHOD(T_NET, maxlen, 0, [[
     if (!net_is_roa(v1.val.net))
       runtime( "ROA expected" );
 
     RESULT(T_INT, i, (v1.val.net->type == NET_ROA4) ?
       ((net_addr_roa4 *) v1.val.net)->max_pxlen :
       ((net_addr_roa6 *) v1.val.net)->max_pxlen);
-  }
+  ]]);
 
-  INST(FI_ASN, 1, 1) { 	/* Get ROA ASN or community ASN part */
-    ARG_ANY(1);
-    RESULT_TYPE(T_INT);
-    switch(v1.type)
-    {
-      case T_NET:
+  /* Get ROA ASN */
+  METHOD(T_NET, asn, 0, [[
         if (!net_is_roa(v1.val.net))
           runtime( "ROA expected" );
 
-        RESULT_(T_INT, i, (v1.val.net->type == NET_ROA4) ?
+        RESULT(T_INT, i, (v1.val.net->type == NET_ROA4) ?
           ((net_addr_roa4 *) v1.val.net)->asn :
           ((net_addr_roa6 *) v1.val.net)->asn);
-        break;
+  ]]);
 
-      case T_PAIR:
-        RESULT_(T_INT, i, v1.val.i >> 16);
-        break;
-
-      case T_LC:
-        RESULT_(T_INT, i, v1.val.lc.asn);
-        break;
-
-      default:
-        runtime( "Net, pair or lc expected" );
-    }
-  }
-
-  INST(FI_IP, 1, 1) {	/* Convert prefix to ... */
-    ARG(1, T_NET);
-    RESULT(T_IP, ip, net_prefix(v1.val.net));
-  }
+  /* Convert prefix to IP */
+  METHOD_R(T_NET, ip, T_IP, ip, net_prefix(v1.val.net));
 
   INST(FI_ROUTE_DISTINGUISHER, 1, 1) {
     ARG(1, T_NET);
+    METHOD_CONSTRUCTOR("rd");
     if (!net_is_vpn(v1.val.net))
       runtime( "VPN address expected" );
     RESULT(T_RD, ec, net_rd(v1.val.net));
   }
 
-  INST(FI_AS_PATH_FIRST, 1, 1) {	/* Get first ASN from AS PATH */
-    ARG(1, T_PATH);
-    u32 as = 0;
-    as_path_get_first(v1.val.ad, &as);
-    RESULT(T_INT, i, as);
-  }
+  /* Get first ASN from AS PATH */
+  METHOD_R(T_PATH, first, T_INT, i, ({ u32 as = 0; as_path_get_first(v1.val.ad, &as); as; }));
 
-  INST(FI_AS_PATH_LAST, 1, 1) {		/* Get last ASN from AS PATH */
-    ARG(1, T_PATH);
-    u32 as = 0;
-    as_path_get_last(v1.val.ad, &as);
-    RESULT(T_INT, i, as);
-  }
+  /* Get last ASN from AS PATH */
+  METHOD_R(T_PATH, last, T_INT, i, ({ u32 as = 0; as_path_get_last(v1.val.ad, &as); as; }));
 
-  INST(FI_AS_PATH_LAST_NAG, 1, 1) {	/* Get last ASN from non-aggregated part of AS PATH */
-    ARG(1, T_PATH);
-    RESULT(T_INT, i, as_path_get_last_nonaggregated(v1.val.ad));
-  }
+  /* Get last ASN from non-aggregated part of AS PATH */
+  METHOD_R(T_PATH, last_nonaggregated, T_INT, i, as_path_get_last_nonaggregated(v1.val.ad));
 
-  INST(FI_PAIR_DATA, 1, 1) {	/* Get data part from the standard community */
-    ARG(1, T_PAIR);
-    RESULT(T_INT, i, v1.val.i & 0xFFFF);
-  }
+  /* Get ASN part from the standard community ASN */
+  METHOD_R(T_PAIR, asn, T_INT, i, v1.val.i >> 16);
 
-  INST(FI_LC_DATA1, 1, 1) {	/* Get data1 part from the large community */
-    ARG(1, T_LC);
-    RESULT(T_INT, i, v1.val.lc.ldp1);
-  }
+  /* Get data part from the standard community */
+  METHOD_R(T_PAIR, data, T_INT, i, v1.val.i & 0xFFFF);
 
-  INST(FI_LC_DATA2, 1, 1) {	/* Get data2 part from the large community */
-    ARG(1, T_LC);
-    RESULT(T_INT, i, v1.val.lc.ldp2);
-  }
+  /* Get ASN part from the large community */
+  METHOD_R(T_LC, asn, T_INT, i, v1.val.lc.asn);
 
-  INST(FI_MIN, 1, 1) {	/* Get minimum element from set */
-    ARG_ANY(1);
-    RESULT_TYPE(f_type_element_type(v1.type));
-    switch(v1.type)
-    {
-      case T_CLIST:
-        {
-          u32 val = 0;
-          int_set_min(v1.val.ad, &val);
-          RESULT_(T_PAIR, i, val);
-        }
-        break;
+  /* Get data1 part from the large community */
+  METHOD_R(T_LC, data1, T_INT, i, v1.val.lc.ldp1);
 
-      case T_ECLIST:
-        {
-          u64 val = 0;
-          ec_set_min(v1.val.ad, &val);
-          RESULT_(T_EC, ec, val);
-        }
-        break;
+  /* Get data2 part from the large community */
+  METHOD_R(T_LC, data2, T_INT, i, v1.val.lc.ldp2);
 
-      case T_LCLIST:
-        {
-          lcomm val = { 0, 0, 0 };
-          lc_set_min(v1.val.ad, &val);
-          RESULT_(T_LC, lc, val);
-        }
-        break;
+  /* Get minimum element from clist */
+  METHOD_R(T_CLIST, min, T_PAIR, i, ({ u32 val = 0; int_set_min(v1.val.ad, &val); val; }));
 
-      default:
-        runtime( "Clist or lclist expected" );
-    }
-  }
+  /* Get maximum element from clist */
+  METHOD_R(T_CLIST, max, T_PAIR, i, ({ u32 val = 0; int_set_max(v1.val.ad, &val); val; }));
 
-  INST(FI_MAX, 1, 1) {	/* Get maximum element from set */
-    ARG_ANY(1);
-    RESULT_TYPE(f_type_element_type(v1.type));
-    switch(v1.type)
-    {
-      case T_CLIST:
-        {
-          u32 val = 0;
-          int_set_max(v1.val.ad, &val);
-          RESULT_(T_PAIR, i, val);
-        }
-        break;
+  /* Get minimum element from eclist */
+  METHOD_R(T_ECLIST, min, T_EC, ec, ({ u64 val = 0; ec_set_min(v1.val.ad, &val); val; }));
 
-      case T_ECLIST:
-        {
-          u64 val = 0;
-          ec_set_max(v1.val.ad, &val);
-          RESULT_(T_EC, ec, val);
-        }
-        break;
+  /* Get maximum element from eclist */
+  METHOD_R(T_ECLIST, max, T_EC, ec, ({ u64 val = 0; ec_set_max(v1.val.ad, &val); val; }));
 
-      case T_LCLIST:
-        {
-          lcomm val = { 0, 0, 0 };
-          lc_set_max(v1.val.ad, &val);
-          RESULT_(T_LC, lc, val);
-        }
-        break;
+  /* Get minimum element from lclist */
+  METHOD_R(T_LCLIST, min, T_LC, lc, ({ lcomm val = {}; lc_set_min(v1.val.ad, &val); val; }));
 
-      default:
-        runtime( "Clist or lclist expected" );
-    }
-  }
+  /* Get maximum element from lclist */
+  METHOD_R(T_LCLIST, max, T_LC, lc, ({ lcomm val = {}; lc_set_max(v1.val.ad, &val); val; }));
 
-  INST(FI_RETURN, 1, 1) {
+  INST(FI_RETURN, 1, 0) {
     NEVER_CONSTANT;
     /* Acquire the return value */
     ARG_ANY(1);
@@ -1079,28 +1126,57 @@
 
   INST(FI_CALL, 0, 1) {
     NEVER_CONSTANT;
+    VARARG;
     SYMBOL;
+    RESULT_TYPE(sym->function->return_type);
+
+    FID_NEW_BODY()
+    ASSERT(sym->class == SYM_FUNCTION);
+
+    if (whati->varcount != sym->function->args)
+      cf_error("Function '%s' expects %u arguments, got %u arguments",
+	       sym->name, sym->function->args, whati->varcount);
+
+    /* Typecheck individual arguments */
+    struct f_inst *a = fvar;
+    struct f_arg *b = sym->function->arg_list;
+    for (uint i = 1; a && b; a = a->next, b = b->next, i++)
+    {
+      enum f_type b_type = b->arg->class & 0xff;
+
+      if (a->type && (a->type != b_type) && !f_const_promotion(a, b_type))
+	cf_error("Argument %u of '%s' must be %s, got %s",
+		 i, sym->name, f_type_name(b_type), f_type_name(a->type));
+    }
+    ASSERT(!a && !b);
+
+    /* Add implicit void slot for the return value */
+    struct f_inst *tmp = f_new_inst(FI_CONSTANT, (struct f_val) { .type = T_VOID });
+    tmp->next = whati->fvar;
+    whati->fvar = tmp;
+    what->size += tmp->size;
+
+    /* Mark recursive calls, they have dummy f_line */
+    if (!sym->function->len)
+      what->flags |= FIF_RECURSIVE;
 
     FID_SAME_BODY()
-      if (!(f1->sym->flags & SYM_FLAG_SAME))
-	return 0;
+    if (!(f1->sym->flags & SYM_FLAG_SAME) && !(f1_->flags & FIF_RECURSIVE))
+      return 0;
 
     FID_ITERATE_BODY()
+    if (!(what->flags & FIF_RECURSIVE))
       BUFFER_PUSH(fit->lines) = whati->sym->function;
 
     FID_INTERPRET_BODY()
 
     /* Push the body on stack */
     LINEX(sym->function);
+    curline.vbase = curline.ventry;
     curline.emask |= FE_RETURN;
 
-    /* Before this instruction was called, there was the T_VOID
-     * automatic return value pushed on value stack and also
-     * sym->function->args function arguments. Setting the
-     * vbase to point to first argument. */
-    ASSERT(curline.ventry >= sym->function->args);
-    curline.ventry -= sym->function->args;
-    curline.vbase = curline.ventry;
+    /* Arguments on stack */
+    fstk->vcnt += sym->function->args;
 
     /* Storage for local variables */
     memset(&(fstk->vstk[fstk->vcnt]), 0, sizeof(struct f_val) * sym->function->vars);
@@ -1117,20 +1193,38 @@
 
     FID_MEMBER(struct f_tree *, tree, [[!same_tree(f1->tree, f2->tree)]], "tree %p", item->tree);
 
+    FID_LINEARIZE_BODY()
+    /* Linearize all branches in switch */
+    struct f_inst *last_inst = NULL;
+    struct f_line *last_line = NULL;
+    for (struct f_tree *t = whati->tree; t; t = t->left)
+    {
+      if (t->data != last_inst)
+      {
+	last_inst = t->data;
+	last_line = f_linearize(t->data, 0);
+      }
+
+      t->data = last_line;
+    }
+
+    /* Balance the tree */
+    item->tree = build_tree(whati->tree);
+
     FID_ITERATE_BODY()
-      tree_walk(whati->tree, f_add_tree_lines, fit);
+    tree_walk(whati->tree, f_add_tree_lines, fit);
 
     FID_INTERPRET_BODY()
-    const struct f_tree *t = find_tree(tree, &v1);
+    /* In parse-time use find_tree_linear(), in runtime use find_tree() */
+    const struct f_tree *t = FID_HIC(,find_tree,find_tree_linear)(tree, &v1);
     if (!t) {
       v1.type = T_VOID;
-      t = find_tree(tree, &v1);
+      t = FID_HIC(,find_tree,find_tree_linear)(tree, &v1);
       if (!t) {
 	debug( "No else statement?\n");
 	FID_HIC(,break,return NULL);
       }
     }
-    /* It is actually possible to have t->data NULL */
 
     LINEX(t->data);
   }
@@ -1138,6 +1232,7 @@
   INST(FI_IP_MASK, 2, 1) { /* IP.MASK(val) */
     ARG(1, T_IP);
     ARG(2, T_INT);
+    METHOD_CONSTRUCTOR("mask");
     RESULT(T_IP, ip, [[ ipa_is_ip4(v1.val.ip) ?
       ipa_from_ip4(ip4_and(ipa_to_ip4(v1.val.ip), ip4_mkmask(v2.val.i))) :
       ipa_from_ip6(ip6_and(ipa_to_ip6(v1.val.ip), ip6_mkmask(v2.val.i))) ]]);
@@ -1146,174 +1241,252 @@
   INST(FI_PATH_PREPEND, 2, 1) {	/* Path prepend */
     ARG(1, T_PATH);
     ARG(2, T_INT);
+    METHOD_CONSTRUCTOR("prepend");
     RESULT(T_PATH, ad, [[ as_path_prepend(fpool, v1.val.ad, v2.val.i) ]]);
   }
 
-  INST(FI_CLIST_ADD, 2, 1) {	/* (Extended) Community list add */
-    ARG_ANY(1);
-    ARG_ANY(2);
-    RESULT_TYPE(f1->type);
-
-    if (v1.type == T_PATH)
-      runtime("Can't add to path");
-
-    else if (v1.type == T_CLIST)
-    {
-      /* Community (or cluster) list */
-      struct f_val dummy;
-
-      if ((v2.type == T_PAIR) || (v2.type == T_QUAD))
-	RESULT_(T_CLIST, ad, [[ int_set_add(fpool, v1.val.ad, v2.val.i) ]]);
-      /* IP->Quad implicit conversion */
-      else if (val_is_ip4(&v2))
-	RESULT_(T_CLIST, ad, [[ int_set_add(fpool, v1.val.ad, ipa_to_u32(v2.val.ip)) ]]);
-      else if ((v2.type == T_SET) && clist_set_type(v2.val.t, &dummy))
-	runtime("Can't add set");
-      else if (v2.type == T_CLIST)
-	RESULT_(T_CLIST, ad, [[ int_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
-      else
-	runtime("Can't add non-pair");
-    }
-
-    else if (v1.type == T_ECLIST)
-    {
-      /* v2.val is either EC or EC-set */
-      if ((v2.type == T_SET) && eclist_set_type(v2.val.t))
-	runtime("Can't add set");
-      else if (v2.type == T_ECLIST)
-	RESULT_(T_ECLIST, ad, [[ ec_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
-      else if (v2.type != T_EC)
-	runtime("Can't add non-ec");
-      else
-	RESULT_(T_ECLIST, ad, [[ ec_set_add(fpool, v1.val.ad, v2.val.ec) ]]);
-    }
-
-    else if (v1.type == T_LCLIST)
-    {
-      /* v2.val is either LC or LC-set */
-      if ((v2.type == T_SET) && lclist_set_type(v2.val.t))
-	runtime("Can't add set");
-      else if (v2.type == T_LCLIST)
-	RESULT_(T_LCLIST, ad, [[ lc_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
-      else if (v2.type != T_LC)
-	runtime("Can't add non-lc");
-      else
-	RESULT_(T_LCLIST, ad, [[ lc_set_add(fpool, v1.val.ad, v2.val.lc) ]]);
-
-    }
-
-    else
-      runtime("Can't add to non-[e|l]clist");
+  /* Community list add */
+  INST(FI_CLIST_ADD_PAIR, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_PAIR);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_CLIST, ad, [[ int_set_add(fpool, v1.val.ad, v2.val.i) ]]);
   }
 
-  INST(FI_CLIST_DEL, 2, 1) {	/* (Extended) Community list add or delete */
-    ARG_ANY(1);
-    ARG_ANY(2);
-    RESULT_TYPE(f1->type);
+  INST(FI_CLIST_ADD_IP, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_IP);
+    METHOD_CONSTRUCTOR("add");
 
-    if (v1.type == T_PATH)
-    {
-      const struct f_tree *set = NULL;
-      u32 key = 0;
+    FID_NEW_BODY();
+    /* IP->Quad implicit conversion, must be before FI_CLIST_ADD_QUAD */
+    cf_warn("Method add(clist, ip) is deprecated, please use add(clist, quad)");
 
-      if (v2.type == T_INT)
-	key = v2.val.i;
-      else if ((v2.type == T_SET) && (v2.val.t->from.type == T_INT))
-	set = v2.val.t;
-      else
-	runtime("Can't delete non-integer (set)");
-
-      RESULT_(T_PATH, ad, [[ as_path_filter(fpool, v1.val.ad, set, key, 0) ]]);
-    }
-
-    else if (v1.type == T_CLIST)
-    {
-      /* Community (or cluster) list */
-      struct f_val dummy;
-
-      if ((v2.type == T_PAIR) || (v2.type == T_QUAD))
-	RESULT_(T_CLIST, ad, [[ int_set_del(fpool, v1.val.ad, v2.val.i) ]]);
-      /* IP->Quad implicit conversion */
-      else if (val_is_ip4(&v2))
-	RESULT_(T_CLIST, ad, [[ int_set_del(fpool, v1.val.ad, ipa_to_u32(v2.val.ip)) ]]);
-      else if ((v2.type == T_SET) && clist_set_type(v2.val.t, &dummy) || (v2.type == T_CLIST))
-	RESULT_(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 0) ]]);
-      else
-	runtime("Can't delete non-pair");
-    }
-
-    else if (v1.type == T_ECLIST)
-    {
-      /* v2.val is either EC or EC-set */
-      if ((v2.type == T_SET) && eclist_set_type(v2.val.t) || (v2.type == T_ECLIST))
-	RESULT_(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
-      else if (v2.type != T_EC)
-	runtime("Can't delete non-ec");
-      else
-	RESULT_(T_ECLIST, ad, [[ ec_set_del(fpool, v1.val.ad, v2.val.ec) ]]);
-    }
-
-    else if (v1.type == T_LCLIST)
-    {
-      /* v2.val is either LC or LC-set */
-      if ((v2.type == T_SET) && lclist_set_type(v2.val.t) || (v2.type == T_LCLIST))
-	RESULT_(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
-      else if (v2.type != T_LC)
-	runtime("Can't delete non-lc");
-      else
-	RESULT_(T_LCLIST, ad, [[ lc_set_del(fpool, v1.val.ad, v2.val.lc) ]]);
-    }
-
-    else
-      runtime("Can't delete in non-[e|l]clist");
+    FID_INTERPRET_BODY();
+    if (!val_is_ip4(&v2)) runtime("Mismatched IP type");
+    RESULT(T_CLIST, ad, [[ int_set_add(fpool, v1.val.ad, ipa_to_u32(v2.val.ip)) ]]);
   }
 
-  INST(FI_CLIST_FILTER, 2, 1) {	/* (Extended) Community list add or delete */
-    ARG_ANY(1);
-    ARG_ANY(2);
-    RESULT_TYPE(f1->type);
+  INST(FI_CLIST_ADD_QUAD, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_QUAD);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_CLIST, ad, [[ int_set_add(fpool, v1.val.ad, v2.val.i) ]]);
+  }
 
-    if (v1.type == T_PATH)
-    {
-      u32 key = 0;
+  INST(FI_CLIST_ADD_CLIST, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_CLIST);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_CLIST, ad, [[ int_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
+  }
 
-      if ((v2.type == T_SET) && (v2.val.t->from.type == T_INT))
-	RESULT_(T_PATH, ad, [[ as_path_filter(fpool, v1.val.ad, v2.val.t, key, 1) ]]);
-      else
-	runtime("Can't filter integer");
-    }
+  INST(FI_ECLIST_ADD_EC, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_EC);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_ECLIST, ad, [[ ec_set_add(fpool, v1.val.ad, v2.val.ec) ]]);
+  }
 
-    else if (v1.type == T_CLIST)
-    {
-      /* Community (or cluster) list */
-      struct f_val dummy;
+  INST(FI_ECLIST_ADD_ECLIST, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_ECLIST);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_ECLIST, ad, [[ ec_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
+  }
 
-      if ((v2.type == T_SET) && clist_set_type(v2.val.t, &dummy) || (v2.type == T_CLIST))
-	RESULT_(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 1) ]]);
-      else
-	runtime("Can't filter pair");
-    }
+  INST(FI_LCLIST_ADD_LC, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_LC);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_LCLIST, ad, [[ lc_set_add(fpool, v1.val.ad, v2.val.lc) ]]);
+  }
 
-    else if (v1.type == T_ECLIST)
-    {
-      /* v2.val is either EC or EC-set */
-      if ((v2.type == T_SET) && eclist_set_type(v2.val.t) || (v2.type == T_ECLIST))
-	RESULT_(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
-      else
-	runtime("Can't filter ec");
-    }
+  INST(FI_LCLIST_ADD_LCLIST, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_LCLIST);
+    METHOD_CONSTRUCTOR("add");
+    RESULT(T_LCLIST, ad, [[ lc_set_union(fpool, v1.val.ad, v2.val.ad) ]]);
+  }
 
-    else if (v1.type == T_LCLIST)
-    {
-      /* v2.val is either LC or LC-set */
-      if ((v2.type == T_SET) && lclist_set_type(v2.val.t) || (v2.type == T_LCLIST))
-	RESULT_(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
-      else
-	runtime("Can't filter lc");
-    }
+  INST(FI_PATH_DELETE_INT, 2, 1) {
+    ARG(1, T_PATH);
+    ARG(2, T_INT);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_PATH, ad, [[ as_path_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
 
-    else
-      runtime("Can't filter non-[e|l]clist");
+  INST(FI_PATH_DELETE_SET, 2, 1) {
+    ARG(1, T_PATH);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("delete");
+
+    if (!path_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_PATH, ad, [[ as_path_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  /* Community list delete */
+  INST(FI_CLIST_DELETE_PAIR, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_PAIR);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_CLIST, ad, [[ int_set_del(fpool, v1.val.ad, v2.val.i) ]]);
+  }
+
+  INST(FI_CLIST_DELETE_IP, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_IP);
+    METHOD_CONSTRUCTOR("delete");
+
+    FID_NEW_BODY();
+    /* IP->Quad implicit conversion, must be before FI_CLIST_DELETE_QUAD */
+    cf_warn("Method delete(clist, ip) is deprecated, please use delete(clist, quad)");
+
+    FID_INTERPRET_BODY();
+    if (!val_is_ip4(&v2)) runtime("Mismatched IP type");
+    RESULT(T_CLIST, ad, [[ int_set_del(fpool, v1.val.ad, ipa_to_u32(v2.val.ip)) ]]);
+  }
+
+  INST(FI_CLIST_DELETE_QUAD, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_QUAD);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_CLIST, ad, [[ int_set_del(fpool, v1.val.ad, v2.val.i) ]]);
+  }
+
+  INST(FI_CLIST_DELETE_CLIST, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_CLIST);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_CLIST_DELETE_SET, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("delete");
+
+    if (!clist_set_type(v2.val.t, &(struct f_val){}))
+      runtime("Mismatched set type");
+
+    RESULT(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_ECLIST_DELETE_EC, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_EC);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_ECLIST, ad, [[ ec_set_del(fpool, v1.val.ad, v2.val.ec) ]]);
+  }
+
+  INST(FI_ECLIST_DELETE_ECLIST, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_ECLIST);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_ECLIST_DELETE_SET, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("delete");
+
+    if (!eclist_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_LCLIST_DELETE_LC, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_LC);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_LCLIST, ad, [[ lc_set_del(fpool, v1.val.ad, v2.val.lc) ]]);
+  }
+
+  INST(FI_LCLIST_DELETE_LCLIST, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_LCLIST);
+    METHOD_CONSTRUCTOR("delete");
+    RESULT(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_LCLIST_DELETE_SET, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("delete");
+
+    if (!lclist_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 0) ]]);
+  }
+
+  INST(FI_PATH_FILTER_SET, 2, 1) {
+    ARG(1, T_PATH);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("filter");
+
+    if (!path_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_PATH, ad, [[ as_path_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_CLIST_FILTER_CLIST, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_CLIST);
+    METHOD_CONSTRUCTOR("filter");
+    RESULT(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_CLIST_FILTER_SET, 2, 1) {
+    ARG(1, T_CLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("filter");
+
+    if (!clist_set_type(v2.val.t, &(struct f_val){}))
+      runtime("Mismatched set type");
+
+    RESULT(T_CLIST, ad, [[ clist_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_ECLIST_FILTER_ECLIST, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_ECLIST);
+    METHOD_CONSTRUCTOR("filter");
+    RESULT(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_ECLIST_FILTER_SET, 2, 1) {
+    ARG(1, T_ECLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("filter");
+
+    if (!eclist_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_ECLIST, ad, [[ eclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_LCLIST_FILTER_LCLIST, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_LCLIST);
+    METHOD_CONSTRUCTOR("filter");
+    RESULT(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
+  }
+
+  INST(FI_LCLIST_FILTER_SET, 2, 1) {
+    ARG(1, T_LCLIST);
+    ARG(2, T_SET);
+    METHOD_CONSTRUCTOR("filter");
+
+    if (!lclist_set_type(v2.val.t))
+      runtime("Mismatched set type");
+
+    RESULT(T_LCLIST, ad, [[ lclist_filter(fpool, v1.val.ad, &v2, 1) ]]);
   }
 
   INST(FI_ROA_CHECK_IMPLICIT, 0, 1) {	/* ROA Check */
@@ -1368,7 +1541,22 @@
 
   }
 
-  INST(FI_FORMAT, 1, 0) {	/* Format */
+  INST(FI_FROM_HEX, 1, 1) {	/* Convert hex text to bytestring */
+    ARG(1, T_STRING);
+
+    int len = bstrhextobin(v1.val.s, NULL);
+    if (len < 0)
+      runtime("Invalid hex string");
+
+    struct adata *bs;
+    bs = falloc(sizeof(struct adata) + len);
+    bs->length = bstrhextobin(v1.val.s, bs->data);
+    ASSERT(bs->length == (size_t) len);
+
+    RESULT(T_BYTESTRING, bs, bs);
+  }
+
+  INST(FI_FORMAT, 1, 1) {	/* Format */
     ARG_ANY(1);
     RESULT(T_STRING, s, val_format_str(fpool, &v1));
   }

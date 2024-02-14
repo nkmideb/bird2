@@ -86,7 +86,6 @@
  * RFC 5065 - AS confederations for BGP
  * RFC 5082 - Generalized TTL Security Mechanism
  * RFC 5492 - Capabilities Advertisement with BGP
- * RFC 5549 - Advertising IPv4 NLRI with an IPv6 Next Hop
  * RFC 5575 - Dissemination of Flow Specification Rules
  * RFC 5668 - 4-Octet AS Specific BGP Extended Community
  * RFC 6286 - AS-Wide Unique BGP Identifier
@@ -101,8 +100,10 @@
  * RFC 8203 - BGP Administrative Shutdown Communication
  * RFC 8212 - Default EBGP Route Propagation Behavior without Policies
  * RFC 8654 - Extended Message Support for BGP
+ * RFC 8950 - Advertising IPv4 NLRI with an IPv6 Next Hop
+ * RFC 9072 - Extended Optional Parameters Length for BGP OPEN Message
  * RFC 9117 - Revised Validation Procedure for BGP Flow Specifications
- * draft-ietf-idr-ext-opt-param-07
+ * RFC 9234 - Route Leak Prevention and Detection Using Roles
  * draft-uttaro-idr-bgp-persistence-04
  * draft-walton-bgp-hostname-capability-02
  */
@@ -124,11 +125,10 @@
 #include "lib/string.h"
 
 #include "bgp.h"
+#include "proto/bmp/bmp.h"
 
 
-struct linpool *bgp_linpool;		/* Global temporary pool */
-struct linpool *bgp_linpool2;		/* Global temporary pool for bgp_rt_notify() */
-static list bgp_sockets;		/* Global list of listening sockets */
+static list STATIC_LIST_INIT(bgp_sockets);		/* Global list of listening sockets */
 
 
 static void bgp_connect(struct bgp_proto *p);
@@ -160,10 +160,6 @@ bgp_open(struct bgp_proto *p)
   uint port = p->cf->local_port;
   uint flags = p->cf->free_bind ? SKF_FREEBIND : 0;
   uint flag_mask = SKF_FREEBIND;
-
-  /* FIXME: Add some global init? */
-  if (!bgp_linpool)
-    init_list(&bgp_sockets);
 
   /* We assume that cf->iface is defined iff cf->local_ip is link-local */
 
@@ -204,12 +200,6 @@ bgp_open(struct bgp_proto *p)
 
   add_tail(&bgp_sockets, &bs->n);
 
-  if (!bgp_linpool)
-  {
-    bgp_linpool  = lp_new_default(proto_pool);
-    bgp_linpool2 = lp_new_default(proto_pool);
-  }
-
   return 0;
 
 err:
@@ -238,15 +228,6 @@ bgp_close(struct bgp_proto *p)
   rfree(bs->sk);
   rem_node(&bs->n);
   mb_free(bs);
-
-  if (!EMPTY_LIST(bgp_sockets))
-    return;
-
-  rfree(bgp_linpool);
-  bgp_linpool = NULL;
-
-  rfree(bgp_linpool2);
-  bgp_linpool2 = NULL;
 }
 
 static inline int
@@ -280,7 +261,7 @@ static inline struct bgp_channel *
 bgp_find_channel(struct bgp_proto *p, u32 afi)
 {
   struct bgp_channel *c;
-  WALK_LIST(c, p->p.channels)
+  BGP_WALK_CHANNELS(p, c)
     if (c->afi == afi)
       return c;
 
@@ -399,10 +380,20 @@ bgp_close_conn(struct bgp_conn *conn)
   rfree(conn->sk);
   conn->sk = NULL;
 
+  mb_free(conn->local_open_msg);
+  conn->local_open_msg = NULL;
+  mb_free(conn->remote_open_msg);
+  conn->remote_open_msg = NULL;
+  conn->local_open_length = 0;
+  conn->remote_open_length = 0;
+
   mb_free(conn->local_caps);
   conn->local_caps = NULL;
   mb_free(conn->remote_caps);
   conn->remote_caps = NULL;
+
+  conn->notify_data = NULL;
+  conn->notify_size = 0;
 }
 
 
@@ -516,8 +507,8 @@ bgp_spawn(struct bgp_proto *pp, ip_addr remote_ip)
   /* This is hack, we would like to share config, but we need to copy it now */
   new_config = config;
   cfg_mem = config->mem;
-  conf_this_scope = config->root_scope;
-  sym = cf_default_name(fmt, &(pp->dynamic_name_counter));
+  config->current_scope = config->root_scope;
+  sym = cf_default_name(config, fmt, &(pp->dynamic_name_counter));
   proto_clone_config(sym, pp->p.cf);
   new_config = NULL;
   cfg_mem = NULL;
@@ -531,6 +522,8 @@ bgp_spawn(struct bgp_proto *pp, ip_addr remote_ip)
 void
 bgp_stop(struct bgp_proto *p, int subcode, byte *data, uint len)
 {
+  proto_shutdown_mpls_map(&p->p, 1);
+
   proto_notify_state(&p->p, PS_STOP);
   bgp_graceful_close_conn(&p->outgoing_conn, subcode, data, len);
   bgp_graceful_close_conn(&p->incoming_conn, subcode, data, len);
@@ -606,7 +599,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
   /* Summary state of ADD_PATH RX for active channels */
   uint summary_add_path_rx = 0;
 
-  WALK_LIST(c, p->p.channels)
+  BGP_WALK_CHANNELS(p, c)
   {
     const struct bgp_af_caps *loc = bgp_find_af_caps(local, c->afi);
     const struct bgp_af_caps *rem = bgp_find_af_caps(peer,  c->afi);
@@ -688,7 +681,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
   p->channel_count = num;
   p->summary_add_path_rx = summary_add_path_rx;
 
-  WALK_LIST(c, p->p.channels)
+  BGP_WALK_CHANNELS(p, c)
   {
     if (c->c.disabled)
       continue;
@@ -701,10 +694,12 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
 
   bgp_conn_set_state(conn, BS_ESTABLISHED);
   proto_notify_state(&p->p, PS_UP);
+  bmp_peer_up(p, conn->local_open_msg, conn->local_open_length,
+	      conn->remote_open_msg, conn->remote_open_length);
 }
 
 static void
-bgp_conn_leave_established_state(struct bgp_proto *p)
+bgp_conn_leave_established_state(struct bgp_conn *conn, struct bgp_proto *p)
 {
   BGP_TRACE(D_EVENTS, "BGP session closed");
   p->last_established = current_time();
@@ -712,6 +707,10 @@ bgp_conn_leave_established_state(struct bgp_proto *p)
 
   if (p->p.proto_state == PS_UP)
     bgp_stop(p, 0, NULL, 0);
+
+  bmp_peer_down(p, p->last_error_class,
+		conn->notify_code, conn->notify_subcode,
+		conn->notify_data, conn->notify_size);
 }
 
 void
@@ -728,7 +727,7 @@ bgp_conn_enter_close_state(struct bgp_conn *conn)
   bgp_start_timer(conn->hold_timer, 10);
 
   if (os == BS_ESTABLISHED)
-    bgp_conn_leave_established_state(p);
+    bgp_conn_leave_established_state(conn, p);
 }
 
 void
@@ -742,7 +741,7 @@ bgp_conn_enter_idle_state(struct bgp_conn *conn)
   ev_schedule(p->event);
 
   if (os == BS_ESTABLISHED)
-    bgp_conn_leave_established_state(p);
+    bgp_conn_leave_established_state(conn, p);
 }
 
 /**
@@ -767,7 +766,7 @@ bgp_handle_graceful_restart(struct bgp_proto *p)
   p->gr_active_num = 0;
 
   struct bgp_channel *c;
-  WALK_LIST(c, p->p.channels)
+  BGP_WALK_CHANNELS(p, c)
   {
     /* FIXME: perhaps check for channel state instead of disabled flag? */
     if (c->c.disabled)
@@ -862,7 +861,7 @@ bgp_graceful_restart_timeout(timer *t)
   if (p->llgr_ready)
   {
     struct bgp_channel *c;
-    WALK_LIST(c, p->p.channels)
+    BGP_WALK_CHANNELS(p, c)
     {
       /* Channel is not in GR and is already flushed */
       if (!c->gr_active)
@@ -1129,6 +1128,7 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
   s->tos = IP_PREC_INTERNET_CONTROL;
   s->password = p->cf->password;
   s->tx_hook = bgp_connected;
+  s->flags = p->cf->free_bind ? SKF_FREEBIND : 0;
   BGP_TRACE(D_EVENTS, "Connecting to %I%J from local address %I%J",
 	    s->daddr, ipa_is_link_local(s->daddr) ? p->cf->iface : NULL,
 	    s->saddr, ipa_is_link_local(s->saddr) ? s->iface : NULL);
@@ -1414,6 +1414,20 @@ bgp_reload_routes(struct channel *C)
   struct bgp_proto *p = (void *) C->proto;
   struct bgp_channel *c = (void *) C;
 
+  /* For MPLS channel, reload all MPLS-aware channels */
+  if (C == p->p.mpls_channel)
+  {
+    BGP_WALK_CHANNELS(p, c)
+      if ((c->desc->mpls) && (p->route_refresh || c->c.in_table))
+	bgp_reload_routes(&c->c);
+
+    return;
+  }
+
+  /* Ignore non-BGP channels */
+  if (C->channel != &channel_bgp)
+    return;
+
   ASSERT(p->conn && (p->route_refresh || c->c.in_table));
 
   if (c->c.in_table)
@@ -1427,6 +1441,10 @@ bgp_feed_begin(struct channel *C, int initial)
 {
   struct bgp_proto *p = (void *) C->proto;
   struct bgp_channel *c = (void *) C;
+
+  /* Ignore non-BGP channels */
+  if (C->channel != &channel_bgp)
+    return;
 
   /* This should not happen */
   if (!p->conn)
@@ -1452,6 +1470,10 @@ bgp_feed_end(struct channel *C)
 {
   struct bgp_proto *p = (void *) C->proto;
   struct bgp_channel *c = (void *) C;
+
+  /* Ignore non-BGP channels */
+  if (C->channel != &channel_bgp)
+    return;
 
   /* This should not happen */
   if (!p->conn)
@@ -1563,11 +1585,13 @@ bgp_start(struct proto *P)
   p->remote_id = 0;
   p->link_addr = IPA_NONE;
 
+  proto_setup_mpls_map(P, RTS_BGP, 1);
+
   /* Lock all channels when in GR recovery mode */
   if (p->p.gr_recovery && p->cf->gr_mode)
   {
     struct bgp_channel *c;
-    WALK_LIST(c, p->p.channels)
+    BGP_WALK_CHANNELS(p, c)
       channel_graceful_restart_lock(&c->c);
   }
 
@@ -1700,6 +1724,7 @@ bgp_init(struct proto_config *CF)
   P->rte_mergable = bgp_rte_mergable;
   P->rte_recalculate = cf->deterministic_med ? bgp_rte_recalculate : NULL;
   P->rte_modify = bgp_rte_modify_stale;
+  P->rte_igp_metric = bgp_rte_igp_metric;
 
   p->cf = cf;
   p->is_internal = (cf->local_as == cf->remote_as);
@@ -1718,10 +1743,13 @@ bgp_init(struct proto_config *CF)
   if (cf->c.parent)
     cf->remote_ip = IPA_NONE;
 
-  /* Add all channels */
+  /* Add all BGP channels */
   struct bgp_channel_config *cc;
-  WALK_LIST(cc, CF->channels)
+  BGP_CF_WALK_CHANNELS(cf, cc)
     proto_add_channel(P, &cc->c);
+
+  /* Add MPLS channel */
+  proto_configure_channel(P, &P->mpls_channel, proto_cf_mpls_channel(CF));
 
   return P;
 }
@@ -1866,7 +1894,7 @@ bgp_find_channel_config(struct bgp_config *cf, u32 afi)
 {
   struct bgp_channel_config *cc;
 
-  WALK_LIST(cc, cf->c.channels)
+  BGP_CF_WALK_CHANNELS(cf, cc)
     if (cc->afi == afi)
       return cc;
 
@@ -1983,6 +2011,15 @@ bgp_postconfig(struct proto_config *CF)
   if (internal && cf->rs_client)
     cf_error("Only external neighbor can be RS client");
 
+  if (internal && (cf->local_role != BGP_ROLE_UNDEFINED))
+    cf_error("Local role cannot be set on IBGP sessions");
+
+  if (interior && (cf->local_role != BGP_ROLE_UNDEFINED))
+    log(L_WARN "BGP roles are not recommended to be used within AS confederations");
+
+  if (cf->require_roles && (cf->local_role == BGP_ROLE_UNDEFINED))
+    cf_error("Local role must be set if roles are required");
+
   if (!cf->confederation && cf->confederation_member)
     cf_error("Confederation ID must be set for member sessions");
 
@@ -2005,9 +2042,24 @@ bgp_postconfig(struct proto_config *CF)
   if (internal && cf->enforce_first_as)
     cf_error("Enforce first AS check is requires EBGP sessions");
 
+  if (cf->keepalive_time > cf->hold_time)
+    cf_error("Keepalive time must be at most hold time");
+
+  if (cf->keepalive_time > (cf->hold_time / 2))
+    log(L_WARN "Keepalive time should be at most 1/2 of hold time");
+
+  if (cf->min_hold_time > cf->hold_time)
+    cf_error("Min hold time (%u) exceeds hold time (%u)",
+	     cf->min_hold_time, cf->hold_time);
+
+  uint keepalive_time = cf->keepalive_time ?: cf->hold_time / 3;
+  if (cf->min_keepalive_time > keepalive_time)
+    cf_error("Min keepalive time (%u) exceeds keepalive time (%u)",
+	     cf->min_keepalive_time, keepalive_time);
+
 
   struct bgp_channel_config *cc;
-  WALK_LIST(cc, CF->channels)
+  BGP_CF_WALK_CHANNELS(cf, cc)
   {
     /* Handle undefined import filter */
     if (cc->c.in_filter == FILTER_UNDEF)
@@ -2034,6 +2086,10 @@ bgp_postconfig(struct proto_config *CF)
     /* Different default for gw_mode */
     if (!cc->gw_mode)
       cc->gw_mode = cf->multihop ? GW_RECURSIVE : GW_DIRECT;
+
+    /* Different default for next_hop_prefer */
+    if (!cc->next_hop_prefer)
+      cc->next_hop_prefer = (cc->gw_mode == GW_DIRECT) ? NHP_GLOBAL : NHP_LOCAL;
 
     /* Defaults based on proto config */
     if (cc->gr_able == 0xff)
@@ -2114,19 +2170,22 @@ bgp_reconfigure(struct proto *P, struct proto_config *CF)
   WALK_LIST(C, p->p.channels)
     C->stale = 1;
 
-  WALK_LIST(cc, new->c.channels)
+  /* Reconfigure BGP channels */
+  BGP_CF_WALK_CHANNELS(new, cc)
   {
     C = (struct channel *) bgp_find_channel(p, cc->afi);
     same = proto_configure_channel(P, &C, &cc->c) && same;
-
-    if (C)
-      C->stale = 0;
   }
+
+  /* Reconfigure MPLS channel */
+  same = proto_configure_channel(P, &P->mpls_channel, proto_cf_mpls_channel(CF)) && same;
 
   WALK_LIST_DELSAFE(C, C2, p->p.channels)
     if (C->stale)
       same = proto_configure_channel(P, &C, NULL) && same;
 
+  if (same)
+    proto_setup_mpls_map(P, RTS_BGP, 1);
 
   if (same && (p->start_state > BSS_PREPARE))
     bgp_update_bfd(p, new->bfd);
@@ -2169,6 +2228,7 @@ bgp_channel_reconfigure(struct channel *C, struct channel_config *CC, int *impor
     return 0;
 
   if ((new->gw_mode != old->gw_mode) ||
+      (new->next_hop_prefer != old->next_hop_prefer) ||
       (new->aigp != old->aigp) ||
       (new->cost != old->cost))
   {
@@ -2228,12 +2288,13 @@ bgp_error(struct bgp_conn *c, uint code, uint subcode, byte *data, int len)
 
   bgp_log_error(p, BE_BGP_TX, "Error", code, subcode, data, ABS(len));
   bgp_store_error(p, c, BE_BGP_TX, (code << 16) | subcode);
-  bgp_conn_enter_close_state(c);
 
   c->notify_code = code;
   c->notify_subcode = subcode;
   c->notify_data = data;
   c->notify_size = (len > 0) ? len : 0;
+
+  bgp_conn_enter_close_state(c);
   bgp_schedule_packet(c, NULL, PKT_NOTIFICATION);
 
   if (code != 6)
@@ -2343,6 +2404,15 @@ bgp_show_afis(int code, char *s, u32 *afis, uint count)
     strcpy(b.end - 32, " ... <too long>");
 
   cli_msg(code, b.start);
+}
+
+const char *
+bgp_format_role_name(u8 role)
+{
+  static const char *bgp_role_names[] = { "provider", "rs_server", "rs_client", "customer", "peer" };
+  if (role == BGP_ROLE_UNDEFINED) return "undefined";
+  if (role < ARRAY_SIZE(bgp_role_names)) return bgp_role_names[role];
+  return "?";
 }
 
 static void
@@ -2473,6 +2543,9 @@ bgp_show_capabilities(struct bgp_proto *p UNUSED, struct bgp_caps *caps)
 
   if (caps->hostname)
     cli_msg(-1006, "      Hostname: %s", caps->hostname);
+
+  if (caps->role != BGP_ROLE_UNDEFINED)
+    cli_msg(-1006, "      Role: %s", bgp_format_role_name(caps->role));
 }
 
 static void
@@ -2560,6 +2633,9 @@ bgp_show_proto_info(struct proto *P)
     {
       channel_show_info(&c->c);
 
+      if (c->c.channel != &channel_bgp)
+	continue;
+
       if (p->gr_active_num)
 	cli_msg(-1006, "    Neighbor GR:    %s", bgp_gr_states[c->gr_active]);
 
@@ -2586,7 +2662,7 @@ bgp_show_proto_info(struct proto *P)
   }
 }
 
-struct channel_class channel_bgp = {
+const struct channel_class channel_bgp = {
   .channel_size =	sizeof(struct bgp_channel),
   .config_size =	sizeof(struct bgp_channel_config),
   .init =		bgp_channel_init,
@@ -2601,7 +2677,7 @@ struct protocol proto_bgp = {
   .template = 		"bgp%d",
   .class =		PROTOCOL_BGP,
   .preference = 	DEF_PREF_BGP,
-  .channel_mask =	NB_IP | NB_VPN | NB_FLOW,
+  .channel_mask =	NB_IP | NB_VPN | NB_FLOW | NB_MPLS,
   .proto_size =		sizeof(struct bgp_proto),
   .config_size =	sizeof(struct bgp_config),
   .postconfig =		bgp_postconfig,
@@ -2615,3 +2691,8 @@ struct protocol proto_bgp = {
   .get_route_info = 	bgp_get_route_info,
   .show_proto_info = 	bgp_show_proto_info
 };
+
+void bgp_build(void)
+{
+  proto_build(&proto_bgp);
+}

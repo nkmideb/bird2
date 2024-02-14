@@ -33,6 +33,7 @@
 #include "nest/route.h"
 #include "nest/protocol.h"
 #include "nest/iface.h"
+#include "nest/mpls.h"
 #include "nest/cli.h"
 #include "nest/locks.h"
 #include "conf/conf.h"
@@ -111,21 +112,21 @@ get_hostname(linpool *lp)
 #ifdef PATH_IPROUTE_DIR
 
 static inline void
-add_num_const(char *name, int val, const char *file, const uint line)
+add_num_const(struct config *conf, char *name, int val, const char *file, const uint line)
 {
   struct f_val *v = cfg_alloc(sizeof(struct f_val));
   *v = (struct f_val) { .type = T_INT, .val.i = val };
-  struct symbol *sym = cf_get_symbol(name);
-  if (sym->class && (sym->scope == conf_this_scope))
+  struct symbol *sym = cf_get_symbol(conf, name);
+  if (sym->class && cf_symbol_is_local(conf, sym))
     cf_error("Error reading value for %s from %s:%d: already defined", name, file, line);
 
-  cf_define_symbol(sym, SYM_CONSTANT | T_INT, val, v);
+  cf_define_symbol(conf, sym, SYM_CONSTANT | T_INT, val, v);
 }
 
 /* the code of read_iproute_table() is based on
    rtnl_tab_initialize() from iproute2 package */
 static void
-read_iproute_table(char *file, char *prefix, uint max)
+read_iproute_table(struct config *conf, char *file, char *prefix, uint max)
 {
   char buf[512], namebuf[512];
   char *name;
@@ -162,7 +163,7 @@ read_iproute_table(char *file, char *prefix, uint max)
       if ((*p < 'a' || *p > 'z') && (*p < 'A' || *p > 'Z') && (*p < '0' || *p > '9') && (*p != '_'))
 	*p = '_';
 
-    add_num_const(namebuf, val, file, line);
+    add_num_const(conf, namebuf, val, file, line);
   }
 
   fclose(fp);
@@ -191,10 +192,10 @@ sysdep_preconfig(struct config *c)
   c->watchdog_warning = UNIX_DEFAULT_WATCHDOG_WARNING;
 
 #ifdef PATH_IPROUTE_DIR
-  read_iproute_table(PATH_IPROUTE_DIR "/rt_protos", "ipp_", 255);
-  read_iproute_table(PATH_IPROUTE_DIR "/rt_realms", "ipr_", 0xffffffff);
-  read_iproute_table(PATH_IPROUTE_DIR "/rt_scopes", "ips_", 255);
-  read_iproute_table(PATH_IPROUTE_DIR "/rt_tables", "ipt_", 0xffffffff);
+  read_iproute_table(c, PATH_IPROUTE_DIR "/rt_protos", "ipp_", 255);
+  read_iproute_table(c, PATH_IPROUTE_DIR "/rt_realms", "ipr_", 0xffffffff);
+  read_iproute_table(c, PATH_IPROUTE_DIR "/rt_scopes", "ips_", 255);
+  read_iproute_table(c, PATH_IPROUTE_DIR "/rt_tables", "ipt_", 0xffffffff);
 #endif
 }
 
@@ -242,6 +243,8 @@ async_config(void)
 {
   struct config *conf;
 
+  config_free_old();
+
   log(L_INFO "Reconfiguration requested by SIGHUP");
   if (!unix_read_config(&conf, config_name))
     {
@@ -280,6 +283,9 @@ cmd_read_config(const char *name)
 void
 cmd_check_config(const char *name)
 {
+  if (cli_access_restricted())
+    return;
+
   struct config *conf = cmd_read_config(name);
   if (!conf)
     return;
@@ -323,6 +329,8 @@ cmd_reconfig(const char *name, int type, uint timeout)
 {
   if (cli_access_restricted())
     return;
+
+  config_free_old();
 
   struct config *conf = cmd_read_config(name);
   if (!conf)
@@ -434,7 +442,7 @@ int
 cli_get_command(cli *c)
 {
   sock *s = c->priv;
-  byte *t = c->rx_aux ? : s->rbuf;
+  byte *t = s->rbuf;
   byte *tend = s->rpos;
   byte *d = c->rx_pos;
   byte *dend = c->rx_buf + CLI_RX_BUF_SIZE - 2;
@@ -445,16 +453,22 @@ cli_get_command(cli *c)
 	t++;
       else if (*t == '\n')
 	{
-	  t++;
-	  c->rx_pos = c->rx_buf;
-	  c->rx_aux = t;
 	  *d = 0;
+	  t++;
+
+	  /* Move remaining data and reset pointers */
+	  uint rest = (t < tend) ? (tend - t) : 0;
+	  memmove(s->rbuf, t, rest);
+	  s->rpos = s->rbuf + rest;
+	  c->rx_pos = c->rx_buf;
+
 	  return (d < dend) ? 1 : -1;
 	}
       else if (d < dend)
 	*d++ = *t++;
     }
-  c->rx_aux = s->rpos = s->rbuf;
+
+  s->rpos = s->rbuf;
   c->rx_pos = d;
   return 0;
 }
@@ -479,6 +493,14 @@ cli_err(sock *s, int err)
   cli_free(s->data);
 }
 
+static void
+cli_connect_err(sock *s UNUSED, int err)
+{
+  ASSERT_DIE(err);
+  if (config->cli_debug)
+    log(L_INFO "Failed to accept CLI connection: %s", strerror(err));
+}
+
 static int
 cli_connect(sock *s, uint size UNUSED)
 {
@@ -493,7 +515,6 @@ cli_connect(sock *s, uint size UNUSED)
   s->pool = c->pool;		/* We need to have all the socket buffers allocated in the cli pool */
   s->fast_rx = 1;
   c->rx_pos = c->rx_buf;
-  c->rx_aux = NULL;
   rmove(s, c->pool);
   return 1;
 }
@@ -507,6 +528,7 @@ cli_init_unix(uid_t use_uid, gid_t use_gid)
   s = cli_sk = sk_new(cli_pool);
   s->type = SK_UNIX_PASSIVE;
   s->rx_hook = cli_connect;
+  s->err_hook = cli_connect_err;
   s->rbsize = 1024;
   s->fast_rx = 1;
 
@@ -868,13 +890,13 @@ main(int argc, char **argv)
   log_switch(1, NULL, NULL);
 
   random_init();
-  net_init();
   resource_init();
   timer_init();
   olock_init();
   io_init();
   rt_init();
   if_init();
+  mpls_init();
 //  roa_init();
   config_init();
 
@@ -897,8 +919,6 @@ main(int argc, char **argv)
     open_pid_file();
 
   protos_build();
-  proto_build(&proto_unix_kernel);
-  proto_build(&proto_unix_iface);
 
   struct config *conf = read_config();
 

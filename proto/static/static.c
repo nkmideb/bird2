@@ -39,6 +39,7 @@
 #include "nest/iface.h"
 #include "nest/protocol.h"
 #include "nest/route.h"
+#include "nest/mpls.h"
 #include "nest/cli.h"
 #include "conf/conf.h"
 #include "filter/filter.h"
@@ -56,10 +57,11 @@ static void
 static_announce_rte(struct static_proto *p, struct static_route *r)
 {
   rta *a = allocz(RTA_MAX_SIZE);
-  a->src = static_get_source(p, r->index);
+  struct rte_src *src = static_get_source(p, r->index);
   a->source = RTS_STATIC;
   a->scope = SCOPE_UNIVERSE;
   a->dest = r->dest;
+  a->pref = p->p.main_channel->preference;
 
   if (r->dest == RTD_UNICAST)
   {
@@ -97,13 +99,49 @@ static_announce_rte(struct static_proto *p, struct static_route *r)
     rta_set_recursive_next_hop(p->p.main_channel->table, a, tab, r->via, IPA_NONE, r->mls);
   }
 
+  if (p->p.mpls_channel)
+  {
+    struct mpls_channel *mc = (void *) p->p.mpls_channel;
+
+    ea_list *ea = alloca(sizeof(ea_list) + 2 * sizeof(eattr));
+    *ea = (ea_list) { .flags = EALF_SORTED };
+    ea->next = a->eattrs;
+    a->eattrs = ea;
+
+    if (r->mpls_label != (uint) -1)
+    {
+      ea->attrs[0] = (eattr) {
+	.id = EA_MPLS_LABEL,
+	.type = EAF_TYPE_INT,
+	.u.data = r->mpls_label,
+      };
+
+      ea->attrs[1] = (eattr) {
+	.id = EA_MPLS_POLICY,
+	.type = EAF_TYPE_INT,
+	.u.data = MPLS_POLICY_STATIC,
+      };
+
+      ea->count = 2;
+    }
+    else
+    {
+      ea->attrs[0] = (eattr) {
+	.id = EA_MPLS_POLICY,
+	.type = EAF_TYPE_INT,
+	.u.data = mc->label_policy,
+      };
+
+      ea->count = 1;
+    }
+  }
+
   /* Already announced */
   if (r->state == SRS_CLEAN)
     return;
 
   /* We skip rta_lookup() here */
-  rte *e = rte_get_temp(a);
-  e->pflags = 0;
+  rte *e = rte_get_temp(a, src);
 
   if (r->cmds)
   {
@@ -113,13 +151,13 @@ static_announce_rte(struct static_proto *p, struct static_route *r)
     net_copy(e->net->n.addr, r->net);
 
     /* Evaluate the filter */
-    f_eval_rte(r->cmds, &e, static_lp);
+    f_eval_rte(r->cmds, &e, static_lp, 0, NULL, NULL);
 
     /* Remove the temporary node */
     e->net = NULL;
   }
 
-  rte_update2(p->p.main_channel, r->net, e, a->src);
+  rte_update2(p->p.main_channel, r->net, e, src);
   r->state = SRS_CLEAN;
 
   if (r->cmds)
@@ -131,7 +169,7 @@ withdraw:
   if (r->state == SRS_DOWN)
     return;
 
-  rte_update2(p->p.main_channel, r->net, NULL, a->src);
+  rte_update2(p->p.main_channel, r->net, NULL, src);
   r->state = SRS_DOWN;
 }
 
@@ -356,7 +394,7 @@ static inline int
 static_same_rte(struct static_route *or, struct static_route *nr)
 {
   /* Note that i_same() requires arguments in (new, old) order */
-  return static_same_dest(or, nr) && f_same(nr->cmds, or->cmds);
+  return (or->mpls_label == nr->mpls_label) && static_same_dest(or, nr) && f_same(nr->cmds, or->cmds);
 }
 
 static void
@@ -434,10 +472,15 @@ static_postconfig(struct proto_config *CF)
   struct static_config *cf = (void *) CF;
   struct static_route *r;
 
+  /* If there is just a MPLS channel, use it as a main channel */
+  if (!CF->net_type && proto_cf_mpls_channel(CF))
+    CF->net_type = NET_MPLS;
+
   if (! proto_cf_main_channel(CF))
     cf_error("Channel not specified");
 
   struct channel_config *cc = proto_cf_main_channel(CF);
+  struct channel_config *mc = proto_cf_mpls_channel(CF);
 
   if (!cf->igp_table_ip4)
     cf->igp_table_ip4 = (cc->table->addr_type == NET_IP4) ?
@@ -448,8 +491,13 @@ static_postconfig(struct proto_config *CF)
       cc->table : cf->c.global->def_tables[NET_IP6];
 
   WALK_LIST(r, cf->routes)
+  {
     if (r->net && (r->net->type != CF->net_type))
       cf_error("Route %N incompatible with channel type", r->net);
+
+    if ((r->mpls_label != (uint) -1) && !mc)
+      cf_error("Route %N has MPLS label, but MPLS channel not specified", r->net);
+  }
 
   static_index_routes(cf);
 }
@@ -462,6 +510,8 @@ static_init(struct proto_config *CF)
   struct static_config *cf = (void *) CF;
 
   P->main_channel = proto_add_channel(P, proto_cf_main_channel(CF));
+
+  proto_configure_channel(P, &P->mpls_channel, proto_cf_mpls_channel(CF));
 
   P->neigh_notify = static_neigh_notify;
   P->reload_routes = static_reload_routes;
@@ -485,7 +535,7 @@ static_start(struct proto *P)
   struct static_route *r;
 
   if (!static_lp)
-    static_lp = lp_new(&root_pool, LP_GOOD_SIZE(1024));
+    static_lp = lp_new(&root_pool);
 
   if (p->igp_table_ip4)
     rt_lock_table(p->igp_table_ip4);
@@ -496,6 +546,8 @@ static_start(struct proto *P)
   p->event = ev_new_init(p->p.pool, static_announce_marked, p);
 
   BUFFER_INIT(p->marked, p->p.pool, 4);
+
+  proto_setup_mpls_map(P, RTS_STATIC, 1);
 
   /* We have to go UP before routes could be installed */
   proto_notify_state(P, PS_UP);
@@ -512,6 +564,8 @@ static_shutdown(struct proto *P)
   struct static_proto *p = (void *) P;
   struct static_config *cf = (void *) P->cf;
   struct static_route *r;
+
+  proto_shutdown_mpls_map(P, 1);
 
   /* Just reset the flag, the routes will be flushed by the nest */
   WALK_LIST(r, cf->routes)
@@ -615,8 +669,11 @@ static_reconfigure(struct proto *P, struct proto_config *CF)
       (IGP_TABLE(o, ip6) != IGP_TABLE(n, ip6)))
     return 0;
 
-  if (!proto_configure_channel(P, &P->main_channel, proto_cf_main_channel(CF)))
+  if (!proto_configure_channel(P, &P->main_channel, proto_cf_main_channel(CF)) ||
+      !proto_configure_channel(P, &P->mpls_channel, proto_cf_mpls_channel(CF)))
     return 0;
+
+  proto_setup_mpls_map(P, RTS_STATIC, 1);
 
   p->p.cf = CF;
 
@@ -721,9 +778,9 @@ static_get_route_info(rte *rte, byte *buf)
 {
   eattr *a = ea_find(rte->attrs->eattrs, EA_GEN_IGP_METRIC);
   if (a)
-    buf += bsprintf(buf, " (%d/%u)", rte->pref, a->u.data);
+    buf += bsprintf(buf, " (%d/%u)", rte->attrs->pref, a->u.data);
   else
-    buf += bsprintf(buf, " (%d)", rte->pref);
+    buf += bsprintf(buf, " (%d)", rte->attrs->pref);
 }
 
 static void
@@ -792,3 +849,9 @@ struct protocol proto_static = {
   .copy_config =	static_copy_config,
   .get_route_info =	static_get_route_info,
 };
+
+void
+static_build(void)
+{
+  proto_build(&proto_static);
+}
